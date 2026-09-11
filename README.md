@@ -18,10 +18,17 @@ The v1.0.0 binary targets macOS 11 or later and was tested on macOS 26.5.1.
 See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.0.0)
 for compatibility details.
 
-Install with one command:
+[**Download the macOS disk image (.dmg)**](https://github.com/maximpri/mlxtop/releases/download/v1.0.0/mlxtop-1.0.0-aarch64-apple-darwin.dmg).
+Open it, double-click **Install mlxtop.pkg**, and follow the installer. Then
+open Terminal and run `mlxtop`. This installs in `/usr/local/bin` and requires
+an administrator account. The package is unsigned and not Apple notarized.
+
+### Install from Terminal
+
+To install in your home directory without sudo:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/maximpri/mlxtop/v1.0.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/maximpri/mlxtop/main/scripts/install.sh | sh
 ```
 
 The installer checks the download’s SHA-256 checksum and places `mlxtop` in
@@ -32,8 +39,6 @@ The installer checks the download’s SHA-256 checksum and places `mlxtop` in
 ```
 
 Add `~/.local/bin` to your `PATH` to run it as `mlxtop` from any terminal.
-You can also [download the release](https://github.com/maximpri/mlxtop/releases/latest)
-and unpack it yourself.
 
 ## Usage
 
@@ -63,7 +68,7 @@ For a text report you can use in a terminal or over SSH:
 ```
 
 This prints memory, paging, GPU, and available model information, then exits.
-If you installed with Cargo, use `mlxtop --once` instead.
+If you used the macOS installer or Cargo, use `mlxtop --once` instead.
 
 You don’t need an account or a cloud API key. Use whatever local model you
 already have running. mlxtop doesn’t download models or send prompts for you.

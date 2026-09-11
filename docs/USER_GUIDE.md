@@ -225,3 +225,24 @@ KEEP_RELEASES              release count to retain
 RESTART_COMMAND            optional restart hook
 HEALTHCHECK_COMMAND        optional post-deploy check
 ```
+
+## Build a macOS disk image
+
+Start with a release payload containing the `mlxtop` binary, documentation,
+`LICENSE`, `THIRD_PARTY_NOTICES.md`, and a `licenses` directory with the dependency
+and Rust standard-library notices. Package it on macOS:
+
+```sh
+./scripts/package-dmg.sh path/to/release-payload target/dmg-release
+```
+
+This creates a compressed DMG containing `Install mlxtop.pkg` and installation
+instructions, plus a `SHA256SUMS` file beside the DMG. The package installs the
+command in `/usr/local/bin` and documentation and notices under
+`/usr/local/share/mlxtop/<version>`. It requires an administrator account.
+The build script creates an unsigned package and does not notarize it.
+
+The Terminal installer in `scripts/install.sh` downloads the same DMG, verifies
+its checksum, and extracts the package to install the command in `~/.local/bin`
+without sudo. Use the installer linked from the current README; the original
+installer in the historical v1.0.0 source tag used the superseded tarball.
