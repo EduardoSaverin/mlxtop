@@ -18,7 +18,6 @@ include = [
   "/LICENSE",
   "/CONTRIBUTING.md",
   "/SECURITY.md",
-  "/OPEN_SOURCE_ROADMAP.md",
   "/THIRD_PARTY_NOTICES.md",
   "/mlxtop.sh",
 ]

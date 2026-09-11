@@ -202,7 +202,7 @@ For UI changes, test both the interactive dashboard and `mlxtop --once` and
 include a terminal screenshot with the pull request. See
 [CONTRIBUTING.md](../CONTRIBUTING.md) for design boundaries and contribution
 licensing. The longer-term provider and architecture plan is documented in
-[OPEN_SOURCE_ROADMAP.md](../OPEN_SOURCE_ROADMAP.md).
+[OPEN_SOURCE_ROADMAP.md](https://github.com/maximpri/mlxtop/blob/main/OPEN_SOURCE_ROADMAP.md).
 
 ## Deployment helper
 
