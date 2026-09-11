@@ -176,6 +176,10 @@ step tripped you up, improving it is a useful place to start. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and design guidelines.
 For larger changes, open an issue first so we can discuss the approach.
 
+## Acknowledgments
+
+mlxtop was developed with Duet coding agent.
+
 ## License
 
 [MIT](LICENSE). Dependencies keep their [own licenses](THIRD_PARTY_NOTICES.md).
