@@ -10,7 +10,7 @@
 
 use std::any::Any;
 use std::backtrace::Backtrace;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, stdout, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -796,7 +796,14 @@ struct LlmTelemetry {
     mlx: MlxTelemetry,
 }
 
-struct LlmTelemetryClient {
+trait TelemetryProvider: Send {
+    fn poll(&mut self) -> Option<LlmTelemetry>;
+    fn provider_name(&self) -> &'static str;
+    fn host(&self) -> &str;
+    fn port(&self) -> u16;
+}
+
+struct OmlxTelemetryClient {
     host: String,
     port: u16,
     session_cookie: Option<String>,
@@ -806,6 +813,800 @@ struct LlmTelemetryClient {
     next_metadata_poll: Instant,
     next_poll: Instant,
     retry_backoff: Duration,
+}
+
+impl TelemetryProvider for OmlxTelemetryClient {
+    fn poll(&mut self) -> Option<LlmTelemetry> {
+        // Delegate to existing implementation
+        let now = Instant::now();
+        if now < self.next_poll {
+            return self.cached.clone();
+        }
+        let telemetry = self.poll_once();
+        if let Some(telemetry) = telemetry {
+            self.cached = Some(telemetry);
+            self.retry_backoff = Duration::from_secs(1);
+            self.next_poll = now + self.retry_backoff;
+        } else {
+            diagnostics_log(
+                "WARN",
+                "llm_api_poll_failed",
+                format!(
+                    "host={} port={} retry_seconds={}",
+                    log_field(&self.host),
+                    self.port,
+                    self.retry_backoff.as_secs()
+                ),
+            );
+            self.next_poll = now + self.retry_backoff;
+            self.retry_backoff = (self.retry_backoff * 2).min(Duration::from_secs(30));
+        }
+        self.cached.clone()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "oMLX"
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl OmlxTelemetryClient {
+    fn poll_once(&mut self) -> Option<LlmTelemetry> {
+        let health_response = match http_request(&self.host, self.port, "GET", "/health", &[], None) {
+            Some(response) => response,
+            None => {
+                self.last_stats_available = None;
+                diagnostics_log(
+                    "WARN",
+                    "llm_health_unreachable",
+                    format!("host={} port={}", log_field(&self.host), self.port),
+                );
+                return None;
+            }
+        };
+        if health_response.status != 200 {
+            self.last_stats_available = None;
+            diagnostics_log(
+                "WARN",
+                "llm_health_http_error",
+                format!(
+                    "host={} port={} status={}",
+                    log_field(&self.host),
+                    self.port,
+                    health_response.status
+                ),
+            );
+            return None;
+        }
+        let health: Value = match serde_json::from_str(&health_response.body) {
+            Ok(health) => health,
+            Err(error) => {
+                self.last_stats_available = None;
+                diagnostics_log(
+                    "WARN",
+                    "llm_health_invalid_json",
+                    format!(
+                        "host={} port={} error={}",
+                        log_field(&self.host),
+                        self.port,
+                        log_field(&error.to_string())
+                    ),
+                );
+                return None;
+            }
+        };
+        if health.get("default_model").is_none() && health.get("engine_pool").is_none() {
+            self.last_stats_available = None;
+            diagnostics_log(
+                "WARN",
+                "llm_health_unrecognized",
+                format!("host={} port={}", log_field(&self.host), self.port),
+            );
+            return None;
+        }
+
+        let stats = self.fetch_stats();
+        let stats_available = stats.is_some();
+        if self.last_stats_available != Some(stats_available) {
+            diagnostics_log(
+                if stats_available { "INFO" } else { "WARN" },
+                "llm_api_stats",
+                format!(
+                    "host={} port={} available={stats_available}",
+                    log_field(&self.host),
+                    self.port
+                ),
+            );
+            self.last_stats_available = Some(stats_available);
+        }
+        let now = Instant::now();
+        if now >= self.next_metadata_poll {
+            let device_info = self.fetch_json("/admin/api/device-info");
+            let settings = self
+                .fetch_json("/admin/api/global-settings")
+                .or_else(|| self.fetch_json("/admin/api/settings"));
+            let metadata = parse_mlx_metadata(device_info.as_ref(), settings.as_ref());
+            let metadata_available = !mlx_metadata_is_empty(&metadata);
+            self.mlx_metadata = merge_mlx_telemetry(&self.mlx_metadata, &metadata);
+            self.next_metadata_poll = now
+                + if metadata_available {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_secs(10)
+                };
+        }
+        let mut telemetry = parse_omlx_telemetry(&health, stats.as_ref());
+        telemetry.mlx = merge_mlx_telemetry(
+            &self.mlx_metadata,
+            &parse_mlx_runtime_telemetry(&health, stats.as_ref()),
+        );
+        telemetry.observed_at = Some(SystemTime::now());
+        Some(telemetry)
+    }
+
+    fn fetch_stats(&mut self) -> Option<Value> {
+        self.fetch_json("/admin/api/stats?scope=session")
+    }
+
+    fn fetch_json(&mut self, path: &str) -> Option<Value> {
+        if self.session_cookie.is_none() {
+            self.login();
+        }
+        let cookie = self.session_cookie.clone()?;
+        let response = http_request(
+            &self.host,
+            self.port,
+            "GET",
+            path,
+            &[("Cookie", cookie.as_str())],
+            None,
+        )?;
+        if response.status == 401 {
+            self.session_cookie = None;
+            self.login();
+            let cookie = self.session_cookie.clone()?;
+            let response = http_request(
+                &self.host,
+                self.port,
+                "GET",
+                path,
+                &[("Cookie", cookie.as_str())],
+                None,
+            )?;
+            if response.status != 200 {
+                return None;
+            }
+            return serde_json::from_str(&response.body).ok();
+        }
+        if response.status != 200 {
+            return None;
+        }
+        serde_json::from_str(&response.body).ok()
+    }
+
+    fn login(&mut self) {
+        if !is_loopback_host(&self.host)
+            && env::var("MLXTOP_ALLOW_REMOTE_AUTH").as_deref() != Ok("1")
+        {
+            return;
+        }
+        let Some(api_key) = read_omlx_api_key() else {
+            return;
+        };
+        let body = json!({ "api_key": api_key, "remember": true }).to_string();
+        let Some(response) = http_request(
+            &self.host,
+            self.port,
+            "POST",
+            "/admin/api/login",
+            &[("Content-Type", "application/json")],
+            Some(&body),
+        ) else {
+            return;
+        };
+        if response.status == 200 {
+            self.session_cookie = response
+                .header("set-cookie")
+                .and_then(|value| value.split(';').next())
+                .map(str::to_owned);
+        }
+    }
+}
+
+struct OllamaTelemetryClient {
+    host: String,
+    port: u16,
+    cached: Option<LlmTelemetry>,
+    next_poll: Instant,
+    retry_backoff: Duration,
+}
+
+impl OllamaTelemetryClient {
+    fn new(config: &Config) -> Self {
+        let host = config.omx.as_ref().and_then(|o| o.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+        let port = config.omx.as_ref().and_then(|o| o.port).unwrap_or(11434);
+        Self {
+            host,
+            port,
+            cached: None,
+            next_poll: Instant::now(),
+            retry_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl TelemetryProvider for OllamaTelemetryClient {
+    fn poll(&mut self) -> Option<LlmTelemetry> {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return self.cached.clone();
+        }
+        let telemetry = self.poll_once();
+        if let Some(telemetry) = telemetry {
+            self.cached = Some(telemetry);
+            self.retry_backoff = Duration::from_secs(1);
+            self.next_poll = now + self.retry_backoff;
+        } else {
+            diagnostics_log(
+                "WARN",
+                "llm_api_poll_failed",
+                format!(
+                    "host={} port={} retry_seconds={}",
+                    log_field(&self.host),
+                    self.port,
+                    self.retry_backoff.as_secs()
+                ),
+            );
+            self.next_poll = now + self.retry_backoff;
+            self.retry_backoff = (self.retry_backoff * 2).min(Duration::from_secs(30));
+        }
+        self.cached.clone()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "Ollama"
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl OllamaTelemetryClient {
+    fn poll_once(&mut self) -> Option<LlmTelemetry> {
+        // Poll /api/ps for running models and /api/version for version
+        let ps_response = http_request(&self.host, self.port, "GET", "/api/ps", &[], None)?;
+        if ps_response.status != 200 {
+            return None;
+        }
+        let ps: Value = serde_json::from_str(&ps_response.body).ok()?;
+
+        let models = ps.as_array()?;
+        if models.is_empty() {
+            return None;
+        }
+
+        // Get the first running model
+        let model = models.first()?;
+
+        let version_response = http_request(&self.host, self.port, "GET", "/api/version", &[], None)?;
+        let version = if version_response.status == 200 {
+            serde_json::from_str::<Value>(&version_response.body).ok()
+        } else {
+            None
+        };
+
+        let mut telemetry = LlmTelemetry {
+            source: TelemetrySource::Live,
+            provider: Some("Ollama".into()),
+            status: Some("running".into()),
+            model: json_string(model, &["name"]),
+            observed_at: Some(SystemTime::now()),
+            ..LlmTelemetry::default()
+        };
+
+        // Try to get more details from /api/show
+        if let Some(model_name) = json_string(model, &["name"]) {
+            let body = json!({ "name": model_name });
+            let show_response = http_request(
+                &self.host,
+                self.port,
+                "POST",
+                "/api/show",
+                &[("Content-Type", "application/json")],
+                Some(&body.to_string()),
+            );
+            if let Some(show) = show_response {
+                if show.status == 200 {
+                    if let Ok(show_data) = serde_json::from_str::<Value>(&show.body) {
+                        telemetry.model = json_string(&show_data, &["model_info", "name"]).or(telemetry.model);
+                    }
+                }
+            }
+        }
+
+        // Check if model is currently generating
+        let done = json_bool(model, &["done"]).unwrap_or(true);
+        telemetry.status = Some(if done { "idle" } else { "generating" }.into());
+
+        telemetry.observed_at = Some(SystemTime::now());
+        Some(telemetry)
+    }
+}
+
+struct LlamaCppTelemetryClient {
+    host: String,
+    port: u16,
+    cached: Option<LlmTelemetry>,
+    next_poll: Instant,
+    retry_backoff: Duration,
+}
+
+impl LlamaCppTelemetryClient {
+    fn new(config: &Config) -> Self {
+        let host = config.omx.as_ref().and_then(|o| o.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+        let port = config.omx.as_ref().and_then(|o| o.port).unwrap_or(8080);
+        Self {
+            host,
+            port,
+            cached: None,
+            next_poll: Instant::now(),
+            retry_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl TelemetryProvider for LlamaCppTelemetryClient {
+    fn poll(&mut self) -> Option<LlmTelemetry> {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return self.cached.clone();
+        }
+        let telemetry = self.poll_once();
+        if let Some(telemetry) = telemetry {
+            self.cached = Some(telemetry);
+            self.retry_backoff = Duration::from_secs(1);
+            self.next_poll = now + self.retry_backoff;
+        } else {
+            diagnostics_log(
+                "WARN",
+                "llm_api_poll_failed",
+                format!(
+                    "host={} port={} retry_seconds={}",
+                    log_field(&self.host),
+                    self.port,
+                    self.retry_backoff.as_secs()
+                ),
+            );
+            self.next_poll = now + self.retry_backoff;
+            self.retry_backoff = (self.retry_backoff * 2).min(Duration::from_secs(30));
+        }
+        self.cached.clone()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "llama.cpp"
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl LlamaCppTelemetryClient {
+    fn poll_once(&mut self) -> Option<LlmTelemetry> {
+        // llama.cpp/llama-server exposes /health, /slots, /props
+        let health_response = http_request(&self.host, self.port, "GET", "/health", &[], None)?;
+        if health_response.status != 200 {
+            return None;
+        }
+        let health: Value = serde_json::from_str(&health_response.body).ok()?;
+
+        let slots_response = http_request(&self.host, self.port, "GET", "/slots", &[], None)?;
+        let slots: Value = if slots_response.status == 200 {
+            serde_json::from_str(&slots_response.body).ok()?
+        } else {
+            json!({})
+        };
+
+        let mut telemetry = LlmTelemetry {
+            source: TelemetrySource::Live,
+            provider: Some("llama.cpp".into()),
+            status: json_string(&health, &["status"]).or(Some("healthy".into())),
+            model: json_string(&health, &["model"]),
+            observed_at: Some(SystemTime::now()),
+            ..LlmTelemetry::default()
+        };
+
+        // Parse slots for generation info
+        if let Some(slots_array) = slots.as_array() {
+            for slot in slots_array {
+                if let Some(state) = json_string(slot, &["state"]) {
+                    if state == "generating" || state == "processing" {
+                        telemetry.status = Some(state.into());
+                        telemetry.generation_tps = json_f64(slot, &["tps"]).filter(|v| *v >= 0.0);
+                        telemetry.generation_tps_live = telemetry.generation_tps.is_some();
+                        telemetry.prompt_tokens = json_u64(slot, &["n_prompt"]);
+                        telemetry.output_tokens = json_u64(slot, &["n_predicted"]);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Get model info from /props
+        let props_response = http_request(&self.host, self.port, "GET", "/props", &[], None);
+        if let Some(props_resp) = props_response {
+            if props_resp.status == 200 {
+                if let Ok(props) = serde_json::from_str::<Value>(&props_resp.body) {
+                    telemetry.model = json_string(&props, &["model"]).or(telemetry.model);
+                }
+            }
+        }
+
+        telemetry.observed_at = Some(SystemTime::now());
+        Some(telemetry)
+    }
+}
+
+struct LMStudioTelemetryClient {
+    host: String,
+    port: u16,
+    cached: Option<LlmTelemetry>,
+    next_poll: Instant,
+    retry_backoff: Duration,
+}
+
+impl LMStudioTelemetryClient {
+    fn new(config: &Config) -> Self {
+        let host = config.omx.as_ref().and_then(|o| o.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+        let port = config.omx.as_ref().and_then(|o| o.port).unwrap_or(1234);
+        Self {
+            host,
+            port,
+            cached: None,
+            next_poll: Instant::now(),
+            retry_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl TelemetryProvider for LMStudioTelemetryClient {
+    fn poll(&mut self) -> Option<LlmTelemetry> {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return self.cached.clone();
+        }
+        let telemetry = self.poll_once();
+        if let Some(telemetry) = telemetry {
+            self.cached = Some(telemetry);
+            self.retry_backoff = Duration::from_secs(1);
+            self.next_poll = now + self.retry_backoff;
+        } else {
+            diagnostics_log(
+                "WARN",
+                "llm_api_poll_failed",
+                format!(
+                    "host={} port={} retry_seconds={}",
+                    log_field(&self.host),
+                    self.port,
+                    self.retry_backoff.as_secs()
+                ),
+            );
+            self.next_poll = now + self.retry_backoff;
+            self.retry_backoff = (self.retry_backoff * 2).min(Duration::from_secs(30));
+        }
+        self.cached.clone()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "LM Studio"
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl LMStudioTelemetryClient {
+    fn poll_once(&mut self) -> Option<LlmTelemetry> {
+        // LM Studio uses OpenAI-compatible API
+        let models_response = http_request(&self.host, self.port, "GET", "/v1/models", &[], None)?;
+        if models_response.status != 200 {
+            return None;
+        }
+        let models: Value = serde_json::from_str(&models_response.body).ok()?;
+
+        let model_data = models.get("data").and_then(|d| d.as_array())?.first()?;
+
+        let mut telemetry = LlmTelemetry {
+            source: TelemetrySource::Live,
+            provider: Some("LM Studio".into()),
+            status: Some("idle".into()),
+            model: json_string(model_data, &["id"]),
+            observed_at: Some(SystemTime::now()),
+            ..LlmTelemetry::default()
+        };
+
+        // Try to get completion stats via /v1/chat/completions (would need active request)
+        // For now, just report model availability
+
+        telemetry.observed_at = Some(SystemTime::now());
+        Some(telemetry)
+    }
+}
+
+struct KoboldCppTelemetryClient {
+    host: String,
+    port: u16,
+    cached: Option<LlmTelemetry>,
+    next_poll: Instant,
+    retry_backoff: Duration,
+}
+
+impl KoboldCppTelemetryClient {
+    fn new(config: &Config) -> Self {
+        let host = config.omx.as_ref().and_then(|o| o.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+        let port = config.omx.as_ref().and_then(|o| o.port).unwrap_or(5001);
+        Self {
+            host,
+            port,
+            cached: None,
+            next_poll: Instant::now(),
+            retry_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl TelemetryProvider for KoboldCppTelemetryClient {
+    fn poll(&mut self) -> Option<LlmTelemetry> {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return self.cached.clone();
+        }
+        let telemetry = self.poll_once();
+        if let Some(telemetry) = telemetry {
+            self.cached = Some(telemetry);
+            self.retry_backoff = Duration::from_secs(1);
+            self.next_poll = now + self.retry_backoff;
+        } else {
+            diagnostics_log(
+                "WARN",
+                "llm_api_poll_failed",
+                format!(
+                    "host={} port={} retry_seconds={}",
+                    log_field(&self.host),
+                    self.port,
+                    self.retry_backoff.as_secs()
+                ),
+            );
+            self.next_poll = now + self.retry_backoff;
+            self.retry_backoff = (self.retry_backoff * 2).min(Duration::from_secs(30));
+        }
+        self.cached.clone()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "KoboldCpp"
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl KoboldCppTelemetryClient {
+    fn poll_once(&mut self) -> Option<LlmTelemetry> {
+        // KoboldCpp uses /api/v1/model and /api/extra/true_model_info
+        let model_response = http_request(&self.host, self.port, "GET", "/api/v1/model", &[], None)?;
+        if model_response.status != 200 {
+            return None;
+        }
+        let model_info: Value = serde_json::from_str(&model_response.body).ok()?;
+
+        let extra_response = http_request(&self.host, self.port, "GET", "/api/extra/true_model_info", &[], None)?;
+        let extra_info: Value = if extra_response.status == 200 {
+            serde_json::from_str(&extra_response.body).ok().unwrap_or(json!({}))
+        } else {
+            json!({})
+        };
+
+        let mut telemetry = LlmTelemetry {
+            source: TelemetrySource::Live,
+            provider: Some("KoboldCpp".into()),
+            status: Some("idle".into()),
+            model: json_string(&model_info, &["result", "model"]).or_else(|| json_string(&extra_info, &["model_name"])),
+            observed_at: Some(SystemTime::now()),
+            ..LlmTelemetry::default()
+        };
+
+        telemetry.observed_at = Some(SystemTime::now());
+        Some(telemetry)
+    }
+}
+
+struct LocalAITelemetryClient {
+    host: String,
+    port: u16,
+    cached: Option<LlmTelemetry>,
+    next_poll: Instant,
+    retry_backoff: Duration,
+}
+
+impl LocalAITelemetryClient {
+    fn new(config: &Config) -> Self {
+        let host = config.omx.as_ref().and_then(|o| o.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+        let port = config.omx.as_ref().and_then(|o| o.port).unwrap_or(8080);
+        Self {
+            host,
+            port,
+            cached: None,
+            next_poll: Instant::now(),
+            retry_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl TelemetryProvider for LocalAITelemetryClient {
+    fn poll(&mut self) -> Option<LlmTelemetry> {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return self.cached.clone();
+        }
+        let telemetry = self.poll_once();
+        if let Some(telemetry) = telemetry {
+            self.cached = Some(telemetry);
+            self.retry_backoff = Duration::from_secs(1);
+            self.next_poll = now + self.retry_backoff;
+        } else {
+            diagnostics_log(
+                "WARN",
+                "llm_api_poll_failed",
+                format!(
+                    "host={} port={} retry_seconds={}",
+                    log_field(&self.host),
+                    self.port,
+                    self.retry_backoff.as_secs()
+                ),
+            );
+            self.next_poll = now + self.retry_backoff;
+            self.retry_backoff = (self.retry_backoff * 2).min(Duration::from_secs(30));
+        }
+        self.cached.clone()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "LocalAI"
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl LocalAITelemetryClient {
+    fn poll_once(&mut self) -> Option<LlmTelemetry> {
+        // LocalAI uses OpenAI-compatible API
+        let models_response = http_request(&self.host, self.port, "GET", "/v1/models", &[], None)?;
+        if models_response.status != 200 {
+            return None;
+        }
+        let models: Value = serde_json::from_str(&models_response.body).ok()?;
+
+        let model_data = models.get("data").and_then(|d| d.as_array())?.first()?;
+
+        let mut telemetry = LlmTelemetry {
+            source: TelemetrySource::Live,
+            provider: Some("LocalAI".into()),
+            status: Some("idle".into()),
+            model: json_string(model_data, &["id"]),
+            observed_at: Some(SystemTime::now()),
+            ..LlmTelemetry::default()
+        };
+
+        telemetry.observed_at = Some(SystemTime::now());
+        Some(telemetry)
+    }
+}
+
+struct LlmTelemetryClient {
+    providers: HashMap<String, Box<dyn TelemetryProvider>>,
+    current_provider: Option<String>,
+}
+
+impl LlmTelemetryClient {
+    fn from_config(config: &Config) -> Self {
+        let mut providers: HashMap<String, Box<dyn TelemetryProvider>> = HashMap::new();
+
+        // oMLX
+        let (omlx_host, omlx_port) = read_omlx_endpoint(config);
+        providers.insert(
+            "oMLX".into(),
+            Box::new(OmlxTelemetryClient {
+                host: omlx_host,
+                port: omlx_port,
+                session_cookie: None,
+                cached: None,
+                mlx_metadata: MlxTelemetry::default(),
+                last_stats_available: None,
+                next_metadata_poll: Instant::now(),
+                next_poll: Instant::now(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        );
+
+        // Ollama
+        providers.insert(
+            "Ollama".into(),
+            Box::new(OllamaTelemetryClient::new(config)),
+        );
+
+        // llama.cpp
+        providers.insert(
+            "llama.cpp".into(),
+            Box::new(LlamaCppTelemetryClient::new(config)),
+        );
+
+        // LM Studio
+        providers.insert(
+            "LM Studio".into(),
+            Box::new(LMStudioTelemetryClient::new(config)),
+        );
+
+        // KoboldCpp
+        providers.insert(
+            "KoboldCpp".into(),
+            Box::new(KoboldCppTelemetryClient::new(config)),
+        );
+
+        // LocalAI
+        providers.insert(
+            "LocalAI".into(),
+            Box::new(LocalAITelemetryClient::new(config)),
+        );
+
+        Self {
+            providers,
+            current_provider: None,
+        }
+    }
+
+    fn poll(&mut self, detected_provider: Option<&str>) -> Option<LlmTelemetry> {
+        let provider_key = detected_provider.unwrap_or("oMLX");
+        if self.current_provider.as_deref() != Some(provider_key) {
+            self.current_provider = Some(provider_key.into());
+        }
+        self.providers
+            .get_mut(provider_key)
+            .and_then(|p| p.poll())
+    }
 }
 
 #[derive(Clone)]
@@ -1300,7 +2101,7 @@ impl Collector {
             annotate_process_pagein_rates(&mut llm_processes, &self.current.llm_processes, elapsed);
         }
         sample.llm_processes = llm_processes;
-        let live_stats = self.llm_client.poll();
+        let live_stats = self.llm_client.poll(detected_provider.as_deref());
         let should_read_log = live_stats.is_none()
             && detected_provider
                 .as_deref()
@@ -5521,212 +6322,6 @@ fn process_provider(name: &str, command: &str) -> Option<String> {
     Some(provider.into())
 }
 
-impl LlmTelemetryClient {
-    fn from_config(config: &Config) -> Self {
-        let (host, port) = read_omlx_endpoint(config);
-        Self {
-            host,
-            port,
-            session_cookie: None,
-            cached: None,
-            mlx_metadata: MlxTelemetry::default(),
-            last_stats_available: None,
-            next_metadata_poll: Instant::now(),
-            next_poll: Instant::now(),
-            retry_backoff: Duration::from_secs(1),
-        }
-    }
-
-    fn poll(&mut self) -> Option<LlmTelemetry> {
-        let now = Instant::now();
-        if now < self.next_poll {
-            return self.cached.clone();
-        }
-        let telemetry = self.poll_once();
-        if let Some(telemetry) = telemetry {
-            self.cached = Some(telemetry);
-            self.retry_backoff = Duration::from_secs(1);
-            self.next_poll = now + self.retry_backoff;
-        } else {
-            diagnostics_log(
-                "WARN",
-                "llm_api_poll_failed",
-                format!(
-                    "host={} port={} retry_seconds={}",
-                    log_field(&self.host),
-                    self.port,
-                    self.retry_backoff.as_secs()
-                ),
-            );
-            self.next_poll = now + self.retry_backoff;
-            self.retry_backoff = (self.retry_backoff * 2).min(Duration::from_secs(30));
-        }
-        self.cached.clone()
-    }
-
-    fn poll_once(&mut self) -> Option<LlmTelemetry> {
-        let health_response = match http_request(&self.host, self.port, "GET", "/health", &[], None)
-        {
-            Some(response) => response,
-            None => {
-                self.last_stats_available = None;
-                diagnostics_log(
-                    "WARN",
-                    "llm_health_unreachable",
-                    format!("host={} port={}", log_field(&self.host), self.port),
-                );
-                return None;
-            }
-        };
-        if health_response.status != 200 {
-            self.last_stats_available = None;
-            diagnostics_log(
-                "WARN",
-                "llm_health_http_error",
-                format!(
-                    "host={} port={} status={}",
-                    log_field(&self.host),
-                    self.port,
-                    health_response.status
-                ),
-            );
-            return None;
-        }
-        let health: Value = match serde_json::from_str(&health_response.body) {
-            Ok(health) => health,
-            Err(error) => {
-                self.last_stats_available = None;
-                diagnostics_log(
-                    "WARN",
-                    "llm_health_invalid_json",
-                    format!(
-                        "host={} port={} error={}",
-                        log_field(&self.host),
-                        self.port,
-                        log_field(&error.to_string())
-                    ),
-                );
-                return None;
-            }
-        };
-        if health.get("default_model").is_none() && health.get("engine_pool").is_none() {
-            self.last_stats_available = None;
-            diagnostics_log(
-                "WARN",
-                "llm_health_unrecognized",
-                format!("host={} port={}", log_field(&self.host), self.port),
-            );
-            return None;
-        }
-
-        let stats = self.fetch_stats();
-        let stats_available = stats.is_some();
-        if self.last_stats_available != Some(stats_available) {
-            diagnostics_log(
-                if stats_available { "INFO" } else { "WARN" },
-                "llm_api_stats",
-                format!(
-                    "host={} port={} available={stats_available}",
-                    log_field(&self.host),
-                    self.port
-                ),
-            );
-            self.last_stats_available = Some(stats_available);
-        }
-        let now = Instant::now();
-        if now >= self.next_metadata_poll {
-            let device_info = self.fetch_json("/admin/api/device-info");
-            let settings = self
-                .fetch_json("/admin/api/global-settings")
-                .or_else(|| self.fetch_json("/admin/api/settings"));
-            let metadata = parse_mlx_metadata(device_info.as_ref(), settings.as_ref());
-            let metadata_available = !mlx_metadata_is_empty(&metadata);
-            self.mlx_metadata = merge_mlx_telemetry(&self.mlx_metadata, &metadata);
-            self.next_metadata_poll = now
-                + if metadata_available {
-                    Duration::from_secs(60)
-                } else {
-                    Duration::from_secs(10)
-                };
-        }
-        let mut telemetry = parse_omlx_telemetry(&health, stats.as_ref());
-        telemetry.mlx = merge_mlx_telemetry(
-            &self.mlx_metadata,
-            &parse_mlx_runtime_telemetry(&health, stats.as_ref()),
-        );
-        telemetry.observed_at = Some(SystemTime::now());
-        Some(telemetry)
-    }
-
-    fn fetch_stats(&mut self) -> Option<Value> {
-        self.fetch_json("/admin/api/stats?scope=session")
-    }
-
-    fn fetch_json(&mut self, path: &str) -> Option<Value> {
-        if self.session_cookie.is_none() {
-            self.login();
-        }
-        let cookie = self.session_cookie.clone()?;
-        let response = http_request(
-            &self.host,
-            self.port,
-            "GET",
-            path,
-            &[("Cookie", cookie.as_str())],
-            None,
-        )?;
-        if response.status == 401 {
-            self.session_cookie = None;
-            self.login();
-            let cookie = self.session_cookie.clone()?;
-            let response = http_request(
-                &self.host,
-                self.port,
-                "GET",
-                path,
-                &[("Cookie", cookie.as_str())],
-                None,
-            )?;
-            if response.status != 200 {
-                return None;
-            }
-            return serde_json::from_str(&response.body).ok();
-        }
-        if response.status != 200 {
-            return None;
-        }
-        serde_json::from_str(&response.body).ok()
-    }
-
-    fn login(&mut self) {
-        if !is_loopback_host(&self.host)
-            && env::var("MLXTOP_ALLOW_REMOTE_AUTH").as_deref() != Ok("1")
-        {
-            return;
-        }
-        let Some(api_key) = read_omlx_api_key() else {
-            return;
-        };
-        let body = json!({ "api_key": api_key, "remember": true }).to_string();
-        let Some(response) = http_request(
-            &self.host,
-            self.port,
-            "POST",
-            "/admin/api/login",
-            &[("Content-Type", "application/json")],
-            Some(&body),
-        ) else {
-            return;
-        };
-        if response.status == 200 {
-            self.session_cookie = response
-                .header("set-cookie")
-                .and_then(|value| value.split(';').next())
-                .map(str::to_owned);
-        }
-    }
-}
-
 struct HttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
@@ -6270,6 +6865,10 @@ fn json_value<'a>(mut value: &'a Value, path: &[&str]) -> Option<&'a Value> {
         value = value.get(*key)?;
     }
     Some(value)
+}
+
+fn json_bool(value: &Value, path: &[&str]) -> Option<bool> {
+    json_value(value, path).and_then(Value::as_bool)
 }
 
 fn read_llm_stats() -> LlmLogStats {
