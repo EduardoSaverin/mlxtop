@@ -24,6 +24,20 @@ server.env
 *.log
 *.log.*
 
+# Local SSH keys and connection state
+.ssh/
+id_rsa
+id_rsa.pub
+id_dsa
+id_dsa.pub
+id_ecdsa*
+id_ed25519*
+ssh_host_*_key
+ssh_host_*_key.pub
+*.ppk
+authorized_keys
+known_hosts
+
 # Python helper caches
 __pycache__/
 *.py[cod]

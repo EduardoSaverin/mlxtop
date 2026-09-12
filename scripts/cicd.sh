@@ -19,8 +19,6 @@ readonly -a DEPLOY_PATHS=(
   Cargo.lock
   src
   mlxtop.sh
-  omlx-watch
-  install_mlx_lm_server_macos.sh
 )
 
 remote_host="${REMOTE_HOST:-${DEPLOY_HOST:-}}"
@@ -191,13 +189,7 @@ reject_whitespace REMOTE_DIR "$remote_dir"
 reject_whitespace REMOTE_TMP_DIR "$remote_tmp_dir"
 
 for path in "${DEPLOY_PATHS[@]}"; do
-  if [[ -e "$PROJECT_ROOT/$path" ]]; then
-    continue
-  fi
-  # This helper is optional in a binary-only deployment and may be kept in a
-  # separate installer checkout. The remote install already treats it as
-  # optional when applying executable permissions.
-  [[ "$path" == install_mlx_lm_server_macos.sh ]] ||
+  [[ -e "$PROJECT_ROOT/$path" ]] ||
     die "deploy path does not exist: $path"
 done
 
@@ -358,12 +350,7 @@ fi
 "$binary" --help >/dev/null
 chmod 755 "$binary"
 if ((build_on_remote)); then
-  for executable in \
-    "$stage_dir/mlxtop.sh" \
-    "$stage_dir/omlx-watch" \
-    "$stage_dir/install_mlx_lm_server_macos.sh"; do
-    [[ -e "$executable" ]] && chmod 755 "$executable"
-  done
+  chmod 755 "$stage_dir/mlxtop.sh"
   printf '%s\n' "$release_id" > "$stage_dir/.release"
 fi
 mv "$stage_dir" "$release_dir"

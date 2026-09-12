@@ -204,7 +204,7 @@ See the [data sources](docs/USER_GUIDE.md#data-sources-and-privacy),
 ## Help and contributions
 
 The [user guide](docs/USER_GUIDE.md) covers setup, controls, troubleshooting,
-and the readings in each view. The [roadmap](OPEN_SOURCE_ROADMAP.md) describes
+and the readings in each view. The [roadmap](https://github.com/maximpri/mlxtop/blob/main/OPEN_SOURCE_ROADMAP.md) describes
 planned work.
 
 If something breaks, [open an issue](https://github.com/maximpri/mlxtop/issues)

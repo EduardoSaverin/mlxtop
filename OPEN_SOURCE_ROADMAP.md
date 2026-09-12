@@ -4,6 +4,10 @@ Status: proposed roadmap
 
 Research date: 2026-08-27
 
+Repository status updated: 2026-09-11. The proposals below describe future
+work, not features promised by the current release. This planning document is
+kept in Git but excluded from the Cargo package.
+
 ## Executive decision
 
 mlxtop should own one problem better than any general system monitor:
@@ -16,11 +20,9 @@ That is a stronger position than becoming another general-purpose `top` clone.
 The product should remain local-first and read-only by default, combine provider
 telemetry with host evidence, and explain conclusions without inventing data.
 
-The current application is a promising alpha with a distinctive UI and useful
-macOS pressure analysis. It is not yet ready to be treated as a stable,
-extensible open-source 1.0 platform. The primary blockers are architecture,
-provider breadth, packaging hygiene, integration testing, and release/community
-infrastructure.
+The current package version is 1.0.0, with documented Apple Silicon installation
+and useful macOS pressure analysis. The next development priorities are modular
+architecture, provider breadth, integration testing, and automated releases.
 
 ## What is already strong
 
@@ -44,7 +46,7 @@ These are product principles worth preserving as explicit compatibility rules.
 
 ### Architecture
 
-The application is concentrated in one 6,600-line `src/main.rs`. That file owns
+The application is concentrated in one large `src/main.rs`. That file owns
 domain types, native collection, subprocess management, rate calculations,
 severity policy, process detection, oMLX HTTP and log parsing, history, journal
 generation, every TUI view, input handling, static output, terminal lifecycle,
@@ -102,33 +104,38 @@ This has several consequences:
 
 ### Testing and operations
 
-- There are 45 useful unit tests, mostly for parsing, chart primitives, rates,
-  thresholds, and small state rules.
-- There are no provider fixture suites, fake-server integration tests, Ratatui
-  snapshot tests, PTY keyboard tests, platform collector contract tests, fuzz
+- Unit tests cover parsing, chart primitives, rates, thresholds, state rules,
+  and UI rendering through Ratatui's `TestBackend`.
+- There are no dedicated provider fixture suites, fake-server integration
+  tests, PTY keyboard tests, platform collector contract tests, fuzz
   targets, long-running sampler tests, or overhead benchmarks.
-- CI checks formatting, Clippy, tests, release compilation, and ShellCheck, but
-  does not check packaging, dependencies, MSRV, documentation links, release
-  artifacts, or terminal snapshots.
-- There is no persistent diagnostic log for failed collectors or providers.
+- CI checks formatting, Clippy, tests, release compilation, ShellCheck, and
+  dependency licenses through `cargo-deny`. Packaging, dependency vulnerability
+  scanning, MSRV builds, documentation links, and release artifacts still need
+  dedicated checks.
+- Persistent diagnostic logging is implemented, including collector/provider
+  failures and terminal lifecycle events. See the user guide and security policy
+  for log locations and privacy boundaries.
 
 ### Open-source readiness
 
-`cargo package --list --allow-dirty` currently includes
-`install_mlx_lm_server_macos.sh`, `omlx-watch`, and the private deployment
-helper. Those files are operationally related to one local setup, not the
-minimal mlxtop crate. Publishing the crate in this state would ship unrelated
-assets.
+Provider-specific installer and watch helpers have been removed from this
+repository and the SSH deployment payload. `Cargo.toml` uses an explicit
+package include list that excludes the deployment helper and this roadmap.
 
-Cargo also reports that package `documentation`, `homepage`, and `repository`
-metadata are missing. This checkout has no configured Git remote and no tags.
-The repository has no changelog, security policy, code of conduct, issue forms,
-pull-request template, support policy, release workflow, checksummed binaries,
-SBOM, or build provenance.
+Cargo metadata includes the repository URL, minimum Rust version, license,
+description, and package include list; `documentation` and `homepage` fields
+remain unset. The repository includes an MIT license, security policy,
+contributor guide, issue templates, a pull-request template, dependency license
+policy, and third-party notices.
 
-If `1.0.0` has not been published, use a pre-1.0 version until the public data
-model and provider contracts stabilize. If it has been published, keep SemVer
-monotonic and define the compatibility promise before the next release.
+The README documents v1.0.0 installation. The DMG packaging script generates
+SHA-256 checksums, and the shell installer verifies them. A changelog, code of
+conduct, dedicated support policy, automated release workflow, SBOM generation,
+and build provenance remain future work.
+
+Keep SemVer monotonic and define the compatibility promise before the next
+release.
 
 ## What comparable projects teach us
 
@@ -407,25 +414,24 @@ llama.cpp, and TGI.
 
 ## Prioritized implementation roadmap
 
-### P0 — Make the repository safe to publish
+### P0 — Complete packaging and contributor foundations
 
 Target: one focused, reproducible crate that strangers can understand and
 build.
 
-- Add `repository`, `homepage`, `documentation`, `rust-version`, and explicit
-  `include` metadata to `Cargo.toml`.
-- Remove oMLX installer/watch scripts from the crate package and mlxtop release
-  payload. Move them to their owning project or a clearly labeled `contrib/`
-  area excluded from packaging.
+- Add `homepage` and `documentation` metadata when their canonical destinations
+  are established; retain the existing repository, MSRV, and package metadata.
+- Keep provider-specific installer/watch scripts in their owning projects,
+  outside the mlxtop crate package and release payload.
 - Split `main.rs` into `lib`, domain, sampling, platform, providers, UI, and
   CLI modules without changing behavior.
-- Introduce typed errors and internal diagnostic logging.
-- Add `CHANGELOG.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`, issue
-  forms, and a pull-request template. GitHub's
+- Introduce typed errors and preserve the existing diagnostic logging.
+- Add `CHANGELOG.md`, `CODE_OF_CONDUCT.md`, and `SUPPORT.md`; maintain the
+  existing security policy and issue/PR templates. GitHub's
   [healthy-contribution guidance](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions)
   describes the expected community files.
-- Document supported macOS versions/chips, required permissions, data sources,
-  network behavior, and privacy guarantees.
+- Keep documented macOS versions/chips, required permissions, data sources,
+  network behavior, and privacy guarantees aligned with each release.
 
 Exit criteria:
 
@@ -524,8 +530,9 @@ Suggested performance budgets:
 
 Target: a trustworthy release can be installed in one command.
 
-- Automate tagged GitHub Releases, Apple Silicon and Intel macOS binaries,
-  checksums, shell installer, and Homebrew formula. The Rust
+- Automate tagged GitHub Releases using the existing Apple Silicon DMG,
+  checksum, and shell installer scripts; evaluate Intel macOS support and a
+  Homebrew formula. The Rust
   [`dist`](https://github.com/axodotdev/cargo-dist) project can generate and
   publish these artifacts.
 - Publish to crates.io if the package name is available and `cargo install`
@@ -536,9 +543,10 @@ Target: a trustworthy release can be installed in one command.
   for binaries and SBOMs.
 - Add automated dependency updates, vulnerability/policy checks, and pinned
   release actions.
-- Add README screenshots, a deterministic demo recording, architecture docs,
-  provider support matrix, troubleshooting, privacy/security model, and a
-  “good first adapter” contributor tutorial.
+- Maintain the existing README screenshots, runtime support information,
+  troubleshooting guide, and privacy/security documentation. Add a deterministic
+  demo recording, architecture docs, and a “good first adapter” contributor
+  tutorial.
 - Use release notes and a public roadmap with small, independently mergeable
   issues.
 
@@ -569,8 +577,8 @@ Create issues small enough to review independently:
 13. Add JSON/NDJSON schema and CLI integration tests.
 14. Add adaptive compact layout and TUI snapshots.
 15. Add deterministic demo scenarios.
-16. Clean crate/release contents and complete Cargo metadata.
-17. Add community health and issue/PR templates.
+16. Add crate/release content checks and complete remaining Cargo metadata.
+17. Add a changelog, code of conduct, and dedicated support policy.
 18. Add tagged, attested release automation and Homebrew packaging.
 
 ## What not to build yet
