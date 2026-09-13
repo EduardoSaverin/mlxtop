@@ -179,10 +179,30 @@ fn diagnostics_path() -> Option<PathBuf> {
             return Some(PathBuf::from(path));
         }
     }
+    if cfg!(target_os = "linux") {
+        if let Ok(state_home) = env::var("XDG_STATE_HOME") {
+            let state_home = state_home.trim();
+            if !state_home.is_empty() {
+                return Some(PathBuf::from(state_home).join("mlxtop/mlxtop.log"));
+            }
+        }
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".local/state/mlxtop/mlxtop.log"))
+            .or_else(|| Some(PathBuf::from("mlxtop.log")));
+    }
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join("Library/Logs/mlxtop/mlxtop.log"))
         .or_else(|| Some(PathBuf::from("mlxtop.log")))
+}
+
+fn diagnostics_default_hint() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "~/.local/state/mlxtop/mlxtop.log"
+    } else {
+        "~/Library/Logs/mlxtop/mlxtop.log"
+    }
 }
 
 fn diagnostics_log(level: &str, event: &str, details: impl AsRef<str>) {
@@ -1076,22 +1096,30 @@ impl Drop for Sampler {
 
 impl Collector {
     fn new(history_limit: usize) -> Self {
-        let total_memory = command_u64("/usr/sbin/sysctl", &["-n", "hw.memsize"]).unwrap_or(0);
-        let mut metal = parse_metal_hardware(
-            &command_text(
-                "/usr/sbin/ioreg",
-                &["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
-            )
-            .unwrap_or_default(),
-        );
-        metal.architecture = command_text("/usr/sbin/sysctl", &["-n", "hw.machine"])
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
-        metal.resource_limit = command_u64("/usr/sbin/sysctl", &["-n", "iogpu.wired_limit_mb"])
-            .filter(|value| *value > 0)
-            .map(|value| value.saturating_mul(MIB));
+        let (total_memory, page_size, metal) = if cfg!(target_os = "macos") {
+            let total_memory = command_u64("/usr/sbin/sysctl", &["-n", "hw.memsize"]).unwrap_or(0);
+            let mut metal = parse_metal_hardware(
+                &command_text(
+                    "/usr/sbin/ioreg",
+                    &["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+                )
+                .unwrap_or_default(),
+            );
+            metal.architecture = command_text("/usr/sbin/sysctl", &["-n", "hw.machine"])
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            metal.resource_limit = command_u64("/usr/sbin/sysctl", &["-n", "iogpu.wired_limit_mb"])
+                .filter(|value| *value > 0)
+                .map(|value| value.saturating_mul(MIB));
+            let page_size =
+                command_u64("/usr/sbin/sysctl", &["-n", "hw.pagesize"]).unwrap_or(16_384);
+            (total_memory, page_size, metal)
+        } else {
+            // Linux (and other non-macOS targets): read from /proc and /sys.
+            (linux_total_memory(), linux_page_size(), linux_metal_init())
+        };
         Self {
-            page_size: command_u64("/usr/sbin/sysctl", &["-n", "hw.pagesize"]).unwrap_or(16_384),
+            page_size,
             total_memory,
             metal,
             llm_client: LlmTelemetryClient::new(),
@@ -1119,50 +1147,16 @@ impl Collector {
             ..Sample::default()
         };
 
-        let level = command_text(
-            "/usr/sbin/sysctl",
-            &["-n", "kern.memorystatus_vm_pressure_level"],
-        )
-        .unwrap_or_default();
-        match level.trim() {
-            "1" => {
-                sample.pressure = "GREEN".into();
-                sample.pressure_meaning = "normal".into();
-                sample.pressure_tone = Tone::Green;
-            }
-            "2" => {
-                sample.pressure = "YELLOW".into();
-                sample.pressure_meaning = "warning".into();
-                sample.pressure_tone = Tone::Yellow;
-            }
-            "4" => {
-                sample.pressure = "RED".into();
-                sample.pressure_meaning = "critical".into();
-                sample.pressure_tone = Tone::Red;
-            }
-            _ => {}
+        if cfg!(target_os = "macos") {
+            sample_macos_memory(&mut sample, self.page_size);
+        } else {
+            sample_linux_memory(&mut sample, self.page_size, self.total_memory);
         }
-
-        if let Some(output) = command_text("/usr/bin/memory_pressure", &["-Q"]) {
-            if let Some(line) = output.lines().find(|line| line.contains("free percentage")) {
-                sample.availability = line
-                    .split(|c: char| !c.is_ascii_digit())
-                    .find(|v| !v.is_empty())
-                    .and_then(|v| v.parse::<u8>().ok());
-            }
-        }
-
-        let vm = command_text("/usr/bin/vm_stat", &[]).unwrap_or_default();
-        sample.vm_available = !vm.trim().is_empty();
-        let counters = parse_vm_stat(&vm, self.page_size);
-        sample.wired = counters.wired;
-        sample.compressor = counters.compressor;
-        sample.compressed_logical = counters.compressed_logical;
-        sample.anonymous = counters.anonymous;
-        sample.file_backed = counters.file_backed;
-        let swap_usage = command_text("/usr/sbin/sysctl", &["-n", "vm.swapusage"]);
-        sample.swap_available = swap_usage.is_some();
-        (sample.swap_total, sample.swap_used) = parse_swap_usage(&swap_usage.unwrap_or_default());
+        let counters = if cfg!(target_os = "macos") {
+            macos_counters_for_rates(self.page_size)
+        } else {
+            linux_counters_for_rates()
+        };
         let process_elapsed = self
             .previous
             .as_ref()
@@ -1208,27 +1202,31 @@ impl Collector {
             swap_used: sample.swap_used,
         });
 
-        let ioreg = command_text(
-            "/usr/sbin/ioreg",
-            &["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
-        )
-        .unwrap_or_default();
-        (sample.gpu_util, sample.gpu_alloc, sample.gpu_in_use) = parse_gpu(&ioreg);
-        let live_metal = parse_metal_hardware(&ioreg);
-        sample.metal.device_name = live_metal.device_name.or(sample.metal.device_name);
-        sample.metal.gpu_cores = live_metal.gpu_cores.or(sample.metal.gpu_cores);
-        sample.metal.renderer_util = live_metal.renderer_util;
-        sample.metal.tiler_util = live_metal.tiler_util;
-        sample.thermal =
-            parse_thermal(&command_text("/usr/bin/pmset", &["-g", "therm"]).unwrap_or_default());
+        if cfg!(target_os = "macos") {
+            sample_macos_gpu_thermal(&mut sample);
+        } else {
+            sample_linux_gpu_thermal(&mut sample);
+        }
 
-        let process_snapshot = parse_processes(
-            &command_text(
-                "/bin/ps",
-                &["-axo", "pid=,rss=,%cpu=,%mem=,state=,pagein=,comm=,args="],
+        let process_snapshot = if cfg!(target_os = "macos") {
+            parse_processes(
+                &command_text(
+                    "/bin/ps",
+                    &["-axo", "pid=,rss=,%cpu=,%mem=,state=,pagein=,comm=,args="],
+                )
+                .unwrap_or_default(),
             )
-            .unwrap_or_default(),
-        );
+        } else {
+            // Linux `ps` has no `pagein` column; `maj_flt` (major faults)
+            // keeps the same positional layout for the shared parser.
+            parse_processes(
+                &command_text(
+                    "ps",
+                    &["-axo", "pid=,rss=,%cpu=,%mem=,stat=,maj_flt=,comm=,args="],
+                )
+                .unwrap_or_default(),
+            )
+        };
         sample.llm_count = process_snapshot.llm_count;
         sample.llm_rss = process_snapshot.llm_rss;
         sample.llm_cpu = process_snapshot.llm_cpu;
@@ -5192,6 +5190,365 @@ fn compact_tokens(value: u64) -> String {
     }
 }
 
+fn sample_macos_memory(sample: &mut Sample, page_size: u64) {
+    let level = command_text(
+        "/usr/sbin/sysctl",
+        &["-n", "kern.memorystatus_vm_pressure_level"],
+    )
+    .unwrap_or_default();
+    match level.trim() {
+        "1" => {
+            sample.pressure = "GREEN".into();
+            sample.pressure_meaning = "normal".into();
+            sample.pressure_tone = Tone::Green;
+        }
+        "2" => {
+            sample.pressure = "YELLOW".into();
+            sample.pressure_meaning = "warning".into();
+            sample.pressure_tone = Tone::Yellow;
+        }
+        "4" => {
+            sample.pressure = "RED".into();
+            sample.pressure_meaning = "critical".into();
+            sample.pressure_tone = Tone::Red;
+        }
+        _ => {}
+    }
+
+    if let Some(output) = command_text("/usr/bin/memory_pressure", &["-Q"]) {
+        if let Some(line) = output.lines().find(|line| line.contains("free percentage")) {
+            sample.availability = line
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|v| !v.is_empty())
+                .and_then(|v| v.parse::<u8>().ok());
+        }
+    }
+
+    let vm = command_text("/usr/bin/vm_stat", &[]).unwrap_or_default();
+    sample.vm_available = !vm.trim().is_empty();
+    let counters = parse_vm_stat(&vm, page_size);
+    sample.wired = counters.wired;
+    sample.compressor = counters.compressor;
+    sample.compressed_logical = counters.compressed_logical;
+    sample.anonymous = counters.anonymous;
+    sample.file_backed = counters.file_backed;
+    let swap_usage = command_text("/usr/sbin/sysctl", &["-n", "vm.swapusage"]);
+    sample.swap_available = swap_usage.is_some();
+    (sample.swap_total, sample.swap_used) = parse_swap_usage(&swap_usage.unwrap_or_default());
+}
+
+fn macos_counters_for_rates(page_size: u64) -> VmCounters {
+    let vm = command_text("/usr/bin/vm_stat", &[]).unwrap_or_default();
+    parse_vm_stat(&vm, page_size)
+}
+
+fn sample_macos_gpu_thermal(sample: &mut Sample) {
+    let ioreg = command_text(
+        "/usr/sbin/ioreg",
+        &["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+    )
+    .unwrap_or_default();
+    (sample.gpu_util, sample.gpu_alloc, sample.gpu_in_use) = parse_gpu(&ioreg);
+    let live_metal = parse_metal_hardware(&ioreg);
+    sample.metal.device_name = live_metal.device_name.or(sample.metal.device_name.take());
+    sample.metal.gpu_cores = live_metal.gpu_cores.or(sample.metal.gpu_cores);
+    sample.metal.renderer_util = live_metal.renderer_util;
+    sample.metal.tiler_util = live_metal.tiler_util;
+    sample.thermal =
+        parse_thermal(&command_text("/usr/bin/pmset", &["-g", "therm"]).unwrap_or_default());
+}
+
+// --- Linux sampling -------------------------------------------------------
+// Linux has no vm_stat / ioreg / pmset. Memory and swap come from
+// /proc/meminfo, paging rates from /proc/vmstat (pswpin/pswpout), pressure
+// level from the MemAvailable ratio blended with /proc/pressure/memory
+// stalls, GPUs from nvidia-smi when present, and thermals from
+// /sys/class/thermal. Anything without a source stays `None`/unavailable
+// and the UI already renders that as a dash.
+
+#[derive(Default)]
+struct LinuxMeminfo {
+    total_kb: u64,
+    available_kb: u64,
+    swap_total_kb: u64,
+    swap_free_kb: u64,
+    anon_kb: u64,
+    file_kb: u64,
+}
+
+fn read_file_to_string(path: &str) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+fn parse_meminfo_value_kb(text: &str, key: &str) -> u64 {
+    text.lines()
+        .find(|line| line.starts_with(key))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn parse_linux_meminfo(text: &str) -> LinuxMeminfo {
+    let total_kb = parse_meminfo_value_kb(text, "MemTotal:");
+    let available_kb = parse_meminfo_value_kb(text, "MemAvailable:");
+    let swap_total_kb = parse_meminfo_value_kb(text, "SwapTotal:");
+    let swap_free_kb = parse_meminfo_value_kb(text, "SwapFree:");
+    let anon_kb = parse_meminfo_value_kb(text, "Active(anon):")
+        .saturating_add(parse_meminfo_value_kb(text, "Inactive(anon):"));
+    let anon_fallback = if anon_kb == 0 {
+        parse_meminfo_value_kb(text, "AnonPages:")
+    } else {
+        anon_kb
+    };
+    let file_kb = parse_meminfo_value_kb(text, "Active(file):")
+        .saturating_add(parse_meminfo_value_kb(text, "Inactive(file):"))
+        .saturating_add(parse_meminfo_value_kb(text, "Cached:"))
+        .saturating_add(parse_meminfo_value_kb(text, "Buffers:"));
+    LinuxMeminfo {
+        total_kb,
+        available_kb,
+        swap_total_kb,
+        swap_free_kb,
+        anon_kb: anon_fallback,
+        file_kb,
+    }
+}
+
+fn parse_linux_vmstat_value(text: &str, key: &str) -> u64 {
+    text.lines()
+        .find(|line| line.starts_with(key))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn parse_linux_paging(text: &str) -> (u64, u64) {
+    (
+        parse_linux_vmstat_value(text, "pswpin"),
+        parse_linux_vmstat_value(text, "pswpout"),
+    )
+}
+
+/// Stall average (`avg10`) of the `full` line in /proc/pressure/memory.
+/// Returns a percentage in the 0–100 range, or `None` when unavailable.
+fn parse_memory_pressure_stall(text: &str) -> Option<f64> {
+    text.lines()
+        .find(|line| line.starts_with("full"))?
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("avg10=")?.parse::<f64>().ok())
+}
+
+fn linux_pressure_state(load_percent: u64, stall_avg10: Option<f64>) -> (&'static str, Tone) {
+    // Base the level on load like the in-app MEMORY_WARN/CRITICAL_LOAD
+    // thresholds (70/85), then let sustained full stalls escalate it.
+    let mut level = if load_percent >= MEMORY_CRITICAL_LOAD {
+        2
+    } else if load_percent >= MEMORY_WARN_LOAD {
+        1
+    } else {
+        0
+    };
+    match stall_avg10 {
+        Some(stall) if stall >= 5.0 => level = level.max(2),
+        Some(stall) if stall >= 1.0 => level = level.max(1),
+        _ => {}
+    }
+    match level {
+        2 => ("RED", Tone::Red),
+        1 => ("YELLOW", Tone::Yellow),
+        _ => ("GREEN", Tone::Green),
+    }
+}
+
+fn linux_total_memory() -> u64 {
+    read_file_to_string("/proc/meminfo")
+        .map(|text| parse_linux_meminfo(&text))
+        .map(|info| info.total_kb.saturating_mul(1024))
+        .unwrap_or(0)
+}
+
+fn linux_page_size() -> u64 {
+    command_u64("getconf", &["PAGESIZE"]).unwrap_or(4096)
+}
+
+fn linux_cpu_architecture() -> Option<String> {
+    command_text("uname", &["-m"])
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Default)]
+struct LinuxGpuInfo {
+    name: Option<String>,
+    util_percent: Option<u8>,
+    used_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    temp_celsius: Option<u64>,
+}
+
+/// Parse one `nvidia-smi --query-gpu` CSV row:
+/// `name, utilization.gpu [%], memory.used [MiB], memory.total [MiB],
+/// temperature.gpu [C]` with `--format=csv,noheader,nounits`.
+fn parse_nvidia_smi_csv(text: &str) -> Option<LinuxGpuInfo> {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut parts: Vec<&str> = line.split(',').map(str::trim).collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    // Some driver versions append "(C)" style units even with `nounits`;
+    // keep only leading digits for the numeric fields.
+    let numeric = |value: &str| {
+        value
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()
+    };
+    let name = parts.remove(0).to_owned();
+    let util = parts.first().and_then(|value| numeric(value));
+    let used_mib = parts.get(1).and_then(|value| numeric(value));
+    let total_mib = parts.get(2).and_then(|value| numeric(value));
+    let temp = parts.get(3).and_then(|value| numeric(value));
+    Some(LinuxGpuInfo {
+        name: (!name.is_empty()).then_some(name),
+        util_percent: util.and_then(|value| u8::try_from(value.min(100)).ok()),
+        used_bytes: used_mib.map(|value| value.saturating_mul(1024 * 1024)),
+        total_bytes: total_mib.map(|value| value.saturating_mul(1024 * 1024)),
+        temp_celsius: temp,
+    })
+}
+
+fn linux_nvidia_info() -> Option<LinuxGpuInfo> {
+    let output = command_text(
+        "nvidia-smi",
+        &[
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    parse_nvidia_smi_csv(&output)
+}
+
+fn linux_metal_init() -> MetalTelemetry {
+    let mut metal = MetalTelemetry {
+        architecture: linux_cpu_architecture(),
+        ..MetalTelemetry::default()
+    };
+    if let Some(gpu) = linux_nvidia_info() {
+        metal.device_name = gpu.name;
+        // Expose VRAM size where the UI expects a device memory limit.
+        metal.resource_limit = gpu.total_bytes;
+    }
+    metal
+}
+
+fn linux_thermal_celsius(nvidia_temp: Option<u64>) -> Option<u64> {
+    let mut hottest = nvidia_temp.unwrap_or(0);
+    if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
+        for entry in entries.flatten() {
+            let path = entry.path().join("temp");
+            if let Ok(text) = fs::read_to_string(&path) {
+                // Values are millidegrees Celsius on most drivers.
+                if let Ok(millidegrees) = text.trim().parse::<i64>() {
+                    if millidegrees > 0 {
+                        hottest = hottest.max((millidegrees / 1000).max(0) as u64);
+                    }
+                }
+            }
+        }
+    }
+    (hottest > 0).then_some(hottest)
+}
+
+fn linux_thermal_label(hottest: Option<u64>) -> String {
+    match hottest {
+        Some(value) if value >= 90 => format!("limited {value}C"),
+        Some(value) if value >= 80 => "warning reported".into(),
+        Some(_) => "no warning".into(),
+        None => "unavailable".into(),
+    }
+}
+
+fn linux_counters_for_rates() -> VmCounters {
+    let mut counters = VmCounters::default();
+    if let Some(text) = read_file_to_string("/proc/vmstat") {
+        let (swapins, swapouts) = parse_linux_paging(&text);
+        counters.swapins = swapins;
+        counters.swapouts = swapouts;
+    }
+    counters
+}
+
+fn sample_linux_memory(sample: &mut Sample, _page_size: u64, total_memory: u64) {
+    let Some(text) = read_file_to_string("/proc/meminfo") else {
+        return;
+    };
+    let info = parse_linux_meminfo(&text);
+    let total = if total_memory > 0 {
+        total_memory
+    } else {
+        info.total_kb.saturating_mul(1024)
+    };
+    sample.total_memory = total;
+    sample.vm_available = true;
+    sample.anonymous = info.anon_kb.saturating_mul(1024);
+    sample.file_backed = info.file_kb.saturating_mul(1024);
+    sample.wired = 0;
+    sample.compressor = 0;
+    sample.compressed_logical = 0;
+
+    if total > 0 {
+        let available = info.available_kb.saturating_mul(1024).min(total);
+        let free_percent = (available.saturating_mul(100) / total).min(100);
+        sample.availability = u8::try_from(free_percent).ok();
+        let load = 100u64.saturating_sub(free_percent);
+        let stall = read_file_to_string("/proc/pressure/memory")
+            .as_deref()
+            .and_then(parse_memory_pressure_stall);
+        let (pressure, tone) = linux_pressure_state(load, stall);
+        sample.pressure = pressure.into();
+        sample.pressure_meaning = match pressure {
+            "GREEN" => "normal",
+            "YELLOW" => "warning",
+            "RED" => "critical",
+            _ => "unavailable",
+        }
+        .into();
+        sample.pressure_tone = tone;
+    }
+
+    sample.swap_total = info.swap_total_kb.saturating_mul(1024);
+    sample.swap_used = info
+        .swap_total_kb
+        .saturating_sub(info.swap_free_kb.min(info.swap_total_kb))
+        .saturating_mul(1024);
+    sample.swap_available = info.swap_total_kb > 0;
+}
+
+fn sample_linux_gpu_thermal(sample: &mut Sample) {
+    let gpu = linux_nvidia_info();
+    if let Some(gpu) = &gpu {
+        sample.gpu_util = gpu.util_percent;
+        sample.gpu_in_use = gpu.used_bytes;
+        sample.gpu_alloc = gpu.total_bytes;
+        if sample.metal.device_name.is_none() {
+            sample.metal.device_name = gpu.name.clone();
+        }
+        if sample.metal.resource_limit.is_none() {
+            sample.metal.resource_limit = gpu.total_bytes;
+        }
+    } else {
+        sample.gpu_util = None;
+        sample.gpu_alloc = None;
+        sample.gpu_in_use = None;
+    }
+    sample.metal.renderer_util = None;
+    sample.metal.tiler_util = None;
+    let hottest = linux_thermal_celsius(gpu.and_then(|info| info.temp_celsius));
+    sample.thermal = linux_thermal_label(hottest);
+}
+
 fn parse_vm_stat(text: &str, page_size: u64) -> VmCounters {
     let mut c = VmCounters::default();
     for line in text.lines() {
@@ -6935,8 +7292,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                      -1, --once         static report\n\
                      -V, --version      show version\n\
                      -h, --help         show help\n\
-                     Diagnostics: ~/Library/Logs/mlxtop/mlxtop.log (override with MLXTOP_LOG_PATH)\n\n\
-                     Interactive keys: q quit · 1 overview · 2 top · 3 journal · tab views · +/- interval · ? help"
+                     Diagnostics: {} (override with MLXTOP_LOG_PATH)\n\n\
+                     Interactive keys: q quit · 1 overview · 2 top · 3 journal · tab views · +/- interval · ? help",
+                    diagnostics_default_hint()
                 );
                 return Ok(());
             }
@@ -7101,6 +7459,69 @@ mod tests {
         assert_eq!(counters.compressed_logical, 4 * 16_384);
         assert_eq!(counters.swapins, 7);
         assert_eq!(counters.swapouts, 3);
+    }
+
+    #[test]
+    fn parses_linux_meminfo_and_swap() {
+        let info = parse_linux_meminfo(
+            "MemTotal:       16290024 kB\nMemAvailable:    7947480 kB\n\
+             Active(anon):    4973124 kB\nInactive(anon):  1904636 kB\n\
+             Active(file):    3432840 kB\nInactive(file):  4277316 kB\n\
+             Cached:          7662848 kB\nBuffers:          171612 kB\n\
+             SwapTotal:       4194300 kB\nSwapFree:         309148 kB\n",
+        );
+        assert_eq!(info.total_kb, 16_290_024);
+        assert_eq!(info.available_kb, 7_947_480);
+        assert_eq!(info.swap_total_kb, 4_194_300);
+        assert_eq!(info.swap_free_kb, 309_148);
+        assert_eq!(info.anon_kb, 4_973_124 + 1_904_636);
+    }
+
+    #[test]
+    fn parses_linux_vmstat_paging_counters() {
+        let (swapins, swapouts) =
+            parse_linux_paging("pswpin 237839\npswpout 1172451\npgpgin 67709690\n");
+        assert_eq!(swapins, 237_839);
+        assert_eq!(swapouts, 1_172_451);
+    }
+
+    #[test]
+    fn linux_pressure_follows_load_and_stall() {
+        assert_eq!(linux_pressure_state(10, None).0, "GREEN");
+        assert_eq!(linux_pressure_state(70, None).0, "YELLOW");
+        assert_eq!(linux_pressure_state(85, None).0, "RED");
+        // Sustained full stalls escalate an otherwise idle machine.
+        assert_eq!(linux_pressure_state(10, Some(2.0)).0, "YELLOW");
+        assert_eq!(linux_pressure_state(10, Some(6.0)).0, "RED");
+    }
+
+    #[test]
+    fn parses_memory_pressure_stall_average() {
+        let text = "some avg10=0.00 avg60=0.00 avg300=0.00 total=18031870\n\
+                    full avg10=2.50 avg60=1.00 avg300=0.20 total=17677407\n";
+        assert_eq!(parse_memory_pressure_stall(text), Some(2.5));
+        assert_eq!(parse_memory_pressure_stall(""), None);
+    }
+
+    #[test]
+    fn parses_nvidia_smi_csv_row() {
+        let info = parse_nvidia_smi_csv("NVIDIA GeForce GTX 1660 SUPER, 23, 974, 6144, 40\n")
+            .expect("csv row should parse");
+        assert_eq!(info.name.as_deref(), Some("NVIDIA GeForce GTX 1660 SUPER"));
+        assert_eq!(info.util_percent, Some(23));
+        assert_eq!(info.used_bytes, Some(974 * 1024 * 1024));
+        assert_eq!(info.total_bytes, Some(6144 * 1024 * 1024));
+        assert_eq!(info.temp_celsius, Some(40));
+    }
+
+    #[test]
+    fn linux_thermal_labels_match_mac_semantics() {
+        // `classify` treats "limited*" and "warning reported" as thermal
+        // causes, so Linux labels must reuse those exact strings.
+        assert!(linux_thermal_label(Some(95)).starts_with("limited"));
+        assert_eq!(linux_thermal_label(Some(85)), "warning reported");
+        assert_eq!(linux_thermal_label(Some(40)), "no warning");
+        assert_eq!(linux_thermal_label(None), "unavailable");
     }
 
     #[test]

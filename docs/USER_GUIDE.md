@@ -106,6 +106,11 @@ them. Missing individual counters are shown as `—`, while a wholly unavailable
 allocator group is summarized as `allocator counters not exposed`; RSS, GPU
 load and model memory are never substituted for it.
 
+On Linux, GPU readings come from `nvidia-smi` when present (device name,
+utilization, VRAM used/total and temperature); renderer/tiler splits and core
+counts are Apple-only and stay unavailable. Thermals come from
+`/sys/class/thermal` (plus the NVIDIA temperature when available).
+
 ## Controls
 
 ### Global
@@ -157,13 +162,15 @@ load and model memory are never substituted for it.
 Every run writes a small local diagnostic log to:
 
 ```text
-~/Library/Logs/mlxtop/mlxtop.log
+~/Library/Logs/mlxtop/mlxtop.log        # macOS
+~/.local/state/mlxtop/mlxtop.log        # Linux ($XDG_STATE_HOME respected)
 ```
 
 Follow it while reproducing a crash:
 
 ```sh
-tail -f ~/Library/Logs/mlxtop/mlxtop.log
+tail -f ~/Library/Logs/mlxtop/mlxtop.log        # macOS
+tail -f ~/.local/state/mlxtop/mlxtop.log        # Linux
 ```
 
 Set `MLXTOP_LOG_PATH` to use another path. The log records session lifecycle,
@@ -179,7 +186,9 @@ and are not uploaded.
 ## Data sources and privacy
 
 mlxtop reads macOS counters from `sysctl`, `memory_pressure`, `vm_stat`,
-`ioreg`, `pmset` and `ps`. It reads local provider endpoints and logs only for
+`ioreg`, `pmset` and `ps`. On Linux it reads `/proc/meminfo`, `/proc/vmstat`,
+`/proc/pressure/memory`, `/sys/class/thermal`, `nvidia-smi` (when present)
+and `ps`. It reads local provider endpoints and logs only for
 supported adapters. The application does not contain analytics, upload
 collected metrics, modify model state or send synthetic inference requests.
 
