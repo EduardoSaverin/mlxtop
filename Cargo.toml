@@ -3,11 +3,11 @@ name = "mlxtop"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Full-screen macOS memory and local-LLM performance monitor"
+description = "Full-screen memory and local-LLM performance monitor"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/maximpri/mlxtop"
-keywords = ["llm", "monitoring", "macos", "ratatui", "tui"]
+keywords = ["llm", "monitoring", "macos", "linux", "ratatui", "tui"]
 categories = ["command-line-utilities"]
 include = [
   "/src/**",

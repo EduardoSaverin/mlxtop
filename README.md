@@ -13,7 +13,8 @@ your model responds.
 
 ## Try it
 
-You’ll need an Apple Silicon Mac and a terminal with Unicode and color support.
+You’ll need an Apple Silicon Mac or a Linux machine and a terminal with
+Unicode and color support.
 The v1.0.0 binary targets macOS 11 or later and was tested on macOS 26.5.1.
 See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.0.0)
 for compatibility details.
@@ -128,8 +129,14 @@ If your shell can’t find `mlxtop`, run `~/.cargo/bin/mlxtop` or add
 
 ## Runtime support and limitations
 
-mlxtop is built for macOS on Apple Silicon. Linux, Windows, and Intel Macs
-aren’t supported targets for this release.
+mlxtop is built for macOS on Apple Silicon and for Linux (x86_64 and
+aarch64). Windows and Intel Macs aren’t supported targets for this release.
+
+On Linux, memory and swap come from `/proc/meminfo`, paging rates from
+`/proc/vmstat`, pressure level from the `MemAvailable` ratio blended with
+`/proc/pressure/memory` stalls, GPU readings from `nvidia-smi` when present,
+and thermals from `/sys/class/thermal`. Counters without a source are shown
+as unavailable. Build from source with `cargo install --path . --locked`.
 
 | Runtime | Available information |
 | --- | --- |
@@ -156,7 +163,9 @@ mlxtop runs without sudo and has no analytics. It reads system counters,
 process information, and supported provider APIs and logs. Your project files
 and model settings stay untouched, and it doesn’t send inference requests.
 
-Diagnostic logs are saved locally at `~/Library/Logs/mlxtop/mlxtop.log`. They
+Diagnostic logs are saved locally at `~/Library/Logs/mlxtop/mlxtop.log` on
+macOS and `~/.local/state/mlxtop/mlxtop.log` on Linux (following
+`XDG_STATE_HOME` when set). They
 include counters and model or provider names, but exclude prompts, model output,
 request bodies, and API keys. These logs aren’t uploaded. By default, provider
 credentials are sent only to endpoints on your own machine.
