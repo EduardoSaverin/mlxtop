@@ -15,6 +15,7 @@ your model responds.
 
 You’ll need an Apple Silicon Mac or a Linux machine and a terminal with
 Unicode and color support.
+The source package is v1.1.0; the published download linked below is v1.0.0.
 The v1.0.0 binary targets macOS 11 or later and was tested on macOS 26.5.1.
 See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.0.0)
 for compatibility details.
@@ -141,8 +142,21 @@ as unavailable. Build from source with `cargo install --path . --locked`.
 | Runtime | Available information |
 | --- | --- |
 | oMLX | Models, processes, prompt and response speed, requests, cache activity, and extra memory counters when available |
-| MLX-LM | Process information alongside system memory and GPU readings |
-| Ollama, llama.cpp / llama-server, LM Studio, KoboldCpp, LocalAI | Process detection. Live response speed and request metrics aren’t supported yet. |
+| llama.cpp / llama-server | Active slots and output counts; average rates when `/metrics` is enabled. Full prompt counts through the optional usage file. |
+| KoboldCpp | Last reported input/output counts and rates through `/api/extra/perf` |
+| MLX-LM, Ollama, LM Studio, LocalAI | Process detection; completed request counts through an optional client-written usage file |
+
+Overview integrates prompt load with generation and prefill on wide terminals.
+It shows the latest count, change from the previous observed request, freshness,
+and cached/uncached segments when reported. Queue and OS process-footprint
+charts complement the system metrics. First-token latency appears only when
+explicitly measured client timings are supplied. See the
+[operator charts](docs/USER_GUIDE.md#operator-charts) for scales and data sources.
+Prompt counts also appear in the static report. Journal records each
+observed request with its prompt count and request-specific cached count when
+available. Polling is sampled: requests that finish between polls can be missed.
+See [request telemetry setup](docs/USER_GUIDE.md#request-token-telemetry) for
+provider selection, custom ports and response-only integrations.
 
 The oMLX connection defaults to `127.0.0.1:8080` and reads settings from
 `~/.config/omlx-coding/server.env`. If you’re missing live readings, check the

@@ -10,6 +10,7 @@ that remain under their respective licenses.
 | crossterm | 0.28.1 | MIT |
 | ratatui | 0.29.0 | MIT |
 | serde_json | 1.0.151 | MIT OR Apache-2.0 |
+| libproc (macOS only) | 0.14.11 | MIT |
 
 The complete dependency graph and exact versions are recorded in `Cargo.lock`.
 CI evaluates every resolved dependency with `cargo-deny`. The current graph is
@@ -22,6 +23,10 @@ limited to the following accepted SPDX licenses and exceptions:
 - Unicode-3.0
 - Unlicense
 - Zlib
+
+The macOS `libproc` build dependencies also have narrowly scoped exceptions
+for `bindgen` 0.72.1 (BSD-3-Clause) and `libloading` 0.8.9 (ISC). Their license
+texts are included in the release license bundle.
 
 No dependency is relicensed as MIT by this project. Source packages downloaded
 by Cargo contain their original copyright and license files. Anyone distributing

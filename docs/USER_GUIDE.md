@@ -8,11 +8,12 @@ Detailed controls, runtime setup, and explanations of the dashboard readings.
 
 | View | Question answered | Key information |
 | --- | --- | --- |
-| Overview | Is inference healthy, and what limits it now? | Generation/prefill rate, diagnosis, cache/queue, memory, paging/compression and GPU |
+| Overview | Is inference healthy, and how large is each request? | Per-request prompt chart and counts, generation/prefill rate, diagnosis, cache/queue, memory, paging/compression and GPU |
 | MLX Top | Which process owns the workload? | PID, command, model, CPU, memory %, RSS, page-ins and serving state |
 | Journal | What changed during this session? | Request lifecycle, provider/model changes, paging, pressure, compression, GPU, thermal and recovery events |
 
-Overview uses a balanced six-chart layout: generation, prefill and cache on the
+Overview embeds the compact prompt-load panel below its operational cards. Beneath
+it, six time-series charts show generation, prefill and cache on the
 first row; GPU, memory load and paging on the second. Each series keeps its own
 unit and scale, so token rates are never visually mixed with percentages. Each
 series is rendered as a stepped trace over a fixed-width tail of the ring
@@ -102,9 +103,30 @@ On Apple Silicon, Metal telemetry is collected locally without sudo from
 `ioreg`: device name, GPU core count, device/renderer/tiler utilization and
 Metal system-memory allocation. `hw.machine` and `iogpu.wired_limit_mb` add
 the architecture and explicit wired limit when the operating system exposes
-them. Missing individual counters are shown as `—`, while a wholly unavailable
-allocator group is summarized as `allocator counters not exposed`; RSS, GPU
-load and model memory are never substituted for it.
+them. The dashboard shows only allocator counters actually reported by the
+provider; when none are available, it omits the allocator summary. The static
+report retains `—` for missing fields. RSS, GPU load and model memory are never
+substituted for allocator readings. mlxtop reads existing provider interfaces
+and operating-system metrics; it does not patch or restart serving runtimes.
+
+On macOS, the throughput card also shows **PROCESS <PID> · footprint**, followed
+by **peak · growth · OS**. These values come directly from `proc_pid_rusage` for
+the detected LLM process with the largest RSS. They describe that one process,
+not the sum of all model servers; the PID identifies the scope.
+
+- **Footprint** is the current OS-accounted physical footprint.
+- **Peak** is the OS-reported lifetime maximum footprint, including activity
+  before mlxtop started.
+- **Growth** is the signed change in footprint per second between consecutive
+  successful samples. It starts as `—` and resets after a missing sample, PID
+  change or process restart. A positive value alone is not a memory alarm.
+
+The static report includes that process's RSS as well. Footprint, RSS and MLX
+allocator memory have different accounting; they are not interchangeable or
+additive. OS process readings remain available while the server is idle and do
+not require provider changes, restarts or administrator access for accessible
+processes. Failed OS reads omit the process summary. This collector is macOS
+only; Linux retains its existing metrics.
 
 On Linux, GPU readings come from `nvidia-smi` when present (device name,
 utilization, VRAM used/total and temperature); renderer/tiler splits and core
@@ -182,6 +204,182 @@ log is capped at 8 MiB and rotated once to `mlxtop.log.1`.
 It contains counters and model/provider names for diagnosis, but never prompts,
 model output, request bodies or provider API keys. Diagnostics are local-only
 and are not uploaded.
+
+## Request-token telemetry
+
+The compact **prompt load** panel is built into **Overview**. It shows the
+latest prompt size, the change from the previous observed request, and freshness
+on a compact summary. At 160 columns and sufficient height, prompt load occupies
+half of the first chart row beside generation and prefill, instead of a separate
+full-width strip. It uses eight rows. Smaller terminals keep the stacked layout.
+Token labels sit above
+the bars so even small requests remain readable.
+`LIVE` requires a matching request in a fresh live sample. Once absent
+or stale it reads `LAST SEEN`; client-reported completions read `REPORTED`. Age comes from the request observation or the client timestamp, not the
+most recent redraw. The last sampled output is not assumed to be a final total.
+
+The colored bar chart reads older to newer, with the selected request marked
+`▶` on the right. When request-specific cache counts are reported, bars stack
+green cached tokens below uncached tokens (cyan for live requests, blue for
+history). Without a cache count, a solid bar represents the whole prompt and
+does not imply zero reuse. Yellow values and `!` mark a material prompt jump.
+Segments are rounded to terminal-cell resolution; exact selected values remain
+in the summary and cache line. Labels accompany color cues.
+
+A jump means at least 25% and 2,048 more tokens than the previous same-model
+observation. The insight area also compares against the median of up to eight
+contiguous preceding requests from the same provider/model, after at least three
+observations. At least 1.5× that median and 2,048 extra tokens is labeled large;
+at most 0.75× is labeled smaller. These are workload comparison heuristics, not
+context-limit or latency alarms. Historical assessments carry a **HISTORY**
+label; their suggested checks are muted when the request is no longer live.
+Cache availability is explicit, including when no request cache count was reported.
+
+Request cache reuse is green at 80% or more, yellow below 20% for prompts of at
+least 4,096 tokens, and cyan otherwise. Low reuse on a cold request is expected;
+the hint to inspect prefix reuse is conditional on repeating prompts.
+
+The chart uses a **fixed 0–65,536-token display scale**, independent of the visible
+maximum. `↑` marks a request above that scale; the headline always gives its
+exact size. This is a display scale, not a context limit or pressure threshold.
+Cache counts appear only when reported for the selected request. Aggregate cache
+statistics and prefill rates are never substituted for request-specific data.
+
+Comparisons are labeled **PREVIOUS OBSERVED**, and are suppressed across changes
+of provider or model. They do not establish conversation membership or explain
+latency on their own. Request identifiers and sampled output counts remain in
+Journal instead of occupying an Overview table.
+
+Up to 240 distinct requests are retained. Repeated polls update an existing
+observation, and past requests stay available. Use **↑ / ↓** or **PgUp / PgDn**
+to browse, **Home** for latest, **End** for oldest, and **r** to reset history.
+
+## Operator charts
+
+On wide terminals, the second chart row contains **process memory**, **queue**,
+**GPU** and **system memory**. Paging and aggregate cache remain below. This
+keeps process footprint separate from overall system load and retains the
+existing throughput and hardware charts.
+
+**Queue** plots active requests in cyan and waiting requests in yellow. The
+scale is fixed at 0–16 requests, with `↑` for overflow and exact current counts
+in the header. Idle zeros are valid; stale, missing and client-reported values
+produce gaps. Queue length is a demand signal, not a latency measurement.
+
+**Process memory** plots the OS physical footprint against a fixed display
+scale of total system RAM. The header identifies the current PID. This RAM
+reference is not the process's configured memory limit. Missing samples and
+process-instance changes break the trace. Both new time-series charts retain
+one captured sample per column, newest at the right; resetting history clears
+them. The process card still shows lifetime peak and signed growth.
+
+**First token** appears only after an explicit client timing is supplied in the
+existing usage JSONL envelope:
+
+```json
+"timings": {"time_to_first_token_ms": 1250}
+```
+
+Use a nonnegative integer measured from request dispatch to the first generated
+token. Add this field alongside `provider`, `request_id`, `observed_at` and
+`usage` in a complete record. The chart uses one column per observed request,
+shows missing timings as gaps, and has a fixed 0–30-second scale with overflow
+markers. Its latest measured value is labeled REPORTED with observation age.
+Repeated polls update the same request rather than adding duplicate bars.
+Prompt-evaluation duration, generation speed and polling intervals are never
+used to estimate first-token latency. No provider changes are required.
+
+When first-token data is available, that chart occupies the wide grid's recent
+Journal preview space; the full Journal remains accessible in its tab. Without
+timing data the preview remains, so no empty latency panel consumes space.
+
+
+Overview shows `PROMPT` for the selected request, alongside the provider and
+telemetry source. The static report includes prompt/output counts and individual
+request observations. Journal records newly observed request IDs and prompt
+counts across oMLX models, including concurrent requests. Equal-sized requests
+remain separate; repeated polls of the same request/count do not create entries.
+The journal retains a bounded deduplication window of 512 observations.
+
+`observed` means a sampled active request. `reported` means a completed request
+reported by a provider or client. Cached tokens are shown only when supplied for
+that request; the aggregate CACHE percentage is never substituted. Counts and
+rates from completed requests are historical and do not enter live rate charts.
+The age on KoboldCpp results is time since first observed, because its performance
+endpoint does not provide the completion timestamp.
+
+Automatic selection follows the detected provider. To select a particular local
+server, use one of these commands:
+
+```sh
+MLXTOP_PROVIDER=koboldcpp ./target/release/mlxtop
+MLXTOP_PROVIDER=llama.cpp MLXTOP_PROVIDER_PORT=8081 ./target/release/mlxtop
+```
+
+Native adapters use loopback only: KoboldCpp defaults to port 5001 and
+llama-server to port 8080. `MLXTOP_PROVIDER_PORT` overrides those ports. No API
+keys are sent by these adapters. oMLX retains its existing endpoint and login
+configuration. Explicit provider selection takes priority over process detection.
+The dashboard selects one provider; it does not merge unrelated servers.
+
+- **oMLX:** reads active request IDs and prompt counts from admin statistics.
+  Some engines/phases do not expose counts; untokenized queued zeros are skipped
+  in the request journal.
+- **KoboldCpp:** reads `/api/extra/perf` last-result counts and rates. This is not
+  a complete request history, and a new active request does not make the previous
+  completion's rates live.
+- **llama-server:** reads `/slots`; optional `/metrics` supplies aggregate average
+  rates when the server starts with `--metrics`. Slot capacity, processed prefill
+  work and retained context are not treated as full request prompt counts. Use
+  the usage-file integration below for exact completion usage.
+- **MLX-LM, Ollama, LM Studio and LocalAI:** their response usage needs client
+  integration. Without it, prompt counts remain unavailable. LocalAI's aggregate
+  usage API is not treated as individual requests.
+
+### Client-reported usage file
+
+A client can append one counters-only JSON object per completed request to a
+local JSONL file, then launch mlxtop with:
+
+```sh
+MLXTOP_USAGE_FILE=/absolute/path/usage.jsonl ./target/release/mlxtop
+```
+
+The file takes priority over native polling. mlxtop only reads it; your client
+must write the records. Each record requires `provider`, a unique `request_id`,
+`observed_at` (completion time as Unix seconds), and token counts. `model` is
+optional. Example shape (replace the timestamp with the completion time):
+
+```json
+{"provider":"mlx-lm","request_id":"req-123","model":"local-model","observed_at":1700000000,"usage":{"prompt_tokens":32768,"completion_tokens":120,"prompt_tokens_details":{"cached_tokens":24576}}}
+```
+
+Supported provider names: `omlx`, `mlx-lm` (also `mlx_lm.server`), `ollama`,
+`llama.cpp` (also `llama-server`), `lmstudio` (also `LM Studio`), `koboldcpp`,
+and `localai`.
+
+Copy only usage counters from the response, with the required envelope above:
+
+| Response format | Counter fields |
+| --- | --- |
+| OpenAI-compatible usage, including MLX-LM | `usage.prompt_tokens`, `usage.completion_tokens`, optional `usage.prompt_tokens_details.cached_tokens` |
+| Ollama native | `prompt_eval_count`, `eval_count` at record top level |
+| LM Studio native | `stats.input_tokens`, `stats.total_output_tokens` |
+
+For MLX-LM streaming, request `stream_options: {"include_usage": true}` and copy
+the final usage chunk. Other streaming APIs may likewise require usage to be
+enabled. Do not include prompts, messages, generated text, request bodies or keys
+in this file. Use opaque request IDs, unique across server restarts.
+
+Only newline-terminated records are read. Invalid records are skipped, missing
+counts remain unavailable, and future timestamps are rejected. Reading is bounded
+to the last 256 KiB and at most 128 recent valid records. The original timestamp
+is retained on every refresh; polling an old file does not make its data live.
+To retain every completion, the client should keep its own usage history. mlxtop's
+sampled journal is not an accounting ledger.
+
+Prompt differences are not labeled as conversation growth: provider request IDs
+do not establish that successive requests belong to the same tool loop.
 
 ## Data sources and privacy
 
