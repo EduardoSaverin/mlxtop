@@ -16,7 +16,7 @@ main() {
         }
     done
 
-    version=1.0.0
+    version=1.1.0
     archive="mlxtop-${version}-aarch64-apple-darwin.dmg"
     base="https://github.com/maximpri/mlxtop/releases/download/v${version}"
     install_dir="${MLXTOP_INSTALL_DIR:-$HOME/.local/bin}"

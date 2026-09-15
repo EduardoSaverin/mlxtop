@@ -129,9 +129,8 @@ remain unset. The repository includes an MIT license, security policy,
 contributor guide, issue templates, a pull-request template, dependency license
 policy, and third-party notices.
 
-The README documents v1.0.0 installation. The DMG packaging script generates
-SHA-256 checksums, and the shell installer verifies them. A changelog, code of
-conduct, dedicated support policy, automated release workflow, SBOM generation,
+The README documents v1.1.0 installation. The DMG packaging script generates
+SHA-256 checksums, and the shell installer verifies them. A code of conduct, dedicated support policy, automated release workflow, SBOM generation,
 and build provenance remain future work.
 
 Keep SemVer monotonic and define the compatibility promise before the next

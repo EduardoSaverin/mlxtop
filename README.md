@@ -9,18 +9,17 @@ your model responds.
 ![mlxtop Overview showing a running model, response speed, memory use, and GPU activity](docs/screenshots/overview.jpg)
 
 [Try it](#try-it) · [Runtime support](#runtime-support-and-limitations) ·
-[User guide](docs/USER_GUIDE.md) · [Report a bug](https://github.com/maximpri/mlxtop/issues)
+[User guide](docs/USER_GUIDE.md) · [Changelog](CHANGELOG.md) · [Report a bug](https://github.com/maximpri/mlxtop/issues)
 
 ## Try it
 
 You’ll need an Apple Silicon Mac or a Linux machine and a terminal with
 Unicode and color support.
-The source package is v1.1.0; the published download linked below is v1.0.0.
-The v1.0.0 binary targets macOS 11 or later and was tested on macOS 26.5.1.
-See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.0.0)
+The v1.1.0 binary targets macOS 11 or later and was tested on macOS 26.5.1.
+See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.1.0)
 for compatibility details.
 
-[**Download the macOS disk image (.dmg)**](https://github.com/maximpri/mlxtop/releases/download/v1.0.0/mlxtop-1.0.0-aarch64-apple-darwin.dmg).
+[**Download the macOS disk image (.dmg)**](https://github.com/maximpri/mlxtop/releases/download/v1.1.0/mlxtop-1.1.0-aarch64-apple-darwin.dmg).
 Open it, double-click **Install mlxtop.pkg**, and follow the installer. Then
 open Terminal and run `mlxtop`. This installs in `/usr/local/bin` and requires
 an administrator account. The package is unsigned and not Apple notarized.
