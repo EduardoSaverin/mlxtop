@@ -360,9 +360,18 @@ pub(super) fn draw(
         let height = bar_area.height.saturating_sub(1);
         // Round total height to whole rows so a short stacked bar can show
         // both colors in one cell. Split that height at eighth-cell precision.
-        let total = ((chart_value(old.usage.prompt) as u128 * height as u128)
+        let mut total = ((chart_value(old.usage.prompt) as u128 * height as u128)
             .div_ceil(TREND_CEILING as u128) as u64)
             * 8;
+        if old
+            .usage
+            .cached
+            .filter(|n| *n <= old.usage.prompt)
+            .is_none()
+        {
+            total = (chart_value(old.usage.prompt) as u128 * height as u128 * 8
+                / TREND_CEILING as u128) as u64;
+        }
         let cached = old
             .usage
             .cached
@@ -424,30 +433,44 @@ pub(super) fn draw(
                 Style::default().fg(color),
             )
         });
+    if columns[1].width < 48 {
+        assessment.title = assessment.title.split(" · ").next().unwrap_or("").into();
+        assessment.detail = assessment.detail.split(" · ").next().unwrap_or("").into();
+        assessment.action = if assessment.action.starts_with("Inspect added") {
+            "Inspect context/tool results."
+        } else if assessment.action.starts_with("For repeating") {
+            "Repeating input? Check reuse."
+        } else if assessment.action.starts_with("Less input") {
+            "Compare prefill time."
+        } else if assessment.action.starts_with("Compare more") {
+            "Collect more requests."
+        } else {
+            "Check prefill, queue and GPU."
+        }
+        .into();
+    }
     let title = if live {
         assessment.title
     } else {
         format!("HISTORY · {}", assessment.title)
     };
-    let lines = vec![
-        Line::from(Span::styled(
-            title,
-            Style::default()
-                .fg(assessment.tone.color())
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(assessment.detail, Style::default().fg(MUTED))),
-        Line::from(cache.unwrap_or_else(|| {
-            Span::styled(
-                "CACHE — not reported for this request",
-                Style::default().fg(MUTED),
-            )
-        })),
-        Line::from(Span::styled(
-            assessment.action,
-            Style::default().fg(if live { Color::White } else { MUTED }),
-        )),
-    ];
+    let lines =
+        vec![
+            Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(assessment.tone.color())
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(assessment.detail, Style::default().fg(MUTED))),
+            Line::from(cache.unwrap_or_else(|| {
+                Span::styled("CACHE — not reported", Style::default().fg(MUTED))
+            })),
+            Line::from(Span::styled(
+                assessment.action,
+                Style::default().fg(if live { Color::White } else { MUTED }),
+            )),
+        ];
     let fit: Vec<_> = lines
         .into_iter()
         .map(|line| {

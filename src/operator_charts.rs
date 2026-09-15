@@ -89,13 +89,18 @@ fn trace(
         let scaled = (u128::from((*value).min(ceiling)) * u128::from(area.height - 1))
             .div_ceil(u128::from(ceiling)) as u16;
         let y = area.bottom() - 1 - scaled;
-        if let Some(old_y) = previous {
-            for row in old_y.min(y)..=old_y.max(y) {
+        let mut glyph = "━";
+        if let Some(old_y) = previous.filter(|old_y| *old_y != y) {
+            for row in old_y.min(y) + 1..old_y.max(y) {
                 frame.buffer_mut()[(x, row)].set_symbol("┃").set_fg(color);
             }
+            frame.buffer_mut()[(x, old_y)]
+                .set_symbol(if y > old_y { "┓" } else { "┛" })
+                .set_fg(color);
+            glyph = if y > old_y { "┗" } else { "┏" };
         }
         frame.buffer_mut()[(x, y)]
-            .set_symbol(if *value > ceiling { "↑" } else { "━" })
+            .set_symbol(if *value > ceiling { "↑" } else { glyph })
             .set_fg(color);
         previous = Some(y);
     }
@@ -151,7 +156,7 @@ pub(super) fn queue(frame: &mut Frame, area: Rect, history: &History, interval: 
                 history
                     .points
                     .len()
-                    .min(area.width.saturating_sub(2) as usize),
+                    .min(area.width.saturating_sub(5) as usize),
                 interval
             )
         ),
@@ -164,22 +169,56 @@ pub(super) fn queue(frame: &mut Frame, area: Rect, history: &History, interval: 
         .enumerate()
         .map(|(i, p)| i > 0 && p.provider != history.points[i - 1].provider)
         .collect();
-    trace(frame, plot, &active_values, &breaks, 16, CYAN);
-    trace(frame, plot, &waiting_values, &breaks, 16, YELLOW);
-    // Labels identify series even when zero-valued traces overlap.
-    if area.width > 25 {
-        let legend = Line::from(vec![
-            Span::styled(" active ", Style::default().fg(CYAN)),
+    if plot.height < 2 || plot.width < 4 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("active ", Style::default().fg(CYAN)),
             Span::styled("waiting ", Style::default().fg(YELLOW)),
-        ]);
+            Span::styled("═ overlap", Style::default().fg(Color::White)),
+        ])),
+        Rect::new(plot.x, plot.y, plot.width, 1),
+    );
+    let graph = Rect::new(plot.x + 3, plot.y + 1, plot.width - 3, plot.height - 1);
+    for (y, label) in [(graph.y, "16"), (graph.bottom() - 1, "0")] {
         frame.render_widget(
-            Paragraph::new(legend),
-            Rect::new(
-                area.x + 1,
-                area.bottom().saturating_sub(1),
-                area.width.saturating_sub(2),
-                1,
-            ),
+            Paragraph::new(label).style(Style::default().fg(MUTED)),
+            Rect::new(plot.x, y, 3, 1),
+        );
+    }
+    for x in graph.x..graph.right() {
+        frame.buffer_mut()[(x, graph.bottom() - 1)]
+            .set_symbol("─")
+            .set_fg(DIM);
+    }
+    trace(frame, graph, &active_values, &breaks, 16, CYAN);
+    let active_cells: Vec<_> = (graph.y..graph.bottom())
+        .flat_map(|y| (graph.x..graph.right()).map(move |x| (x, y)))
+        .filter_map(|(x, y)| {
+            let cell = &frame.buffer_mut()[(x, y)];
+            (cell.fg == CYAN).then_some((x, y, cell.symbol() == "↑"))
+        })
+        .collect();
+    trace(frame, graph, &waiting_values, &breaks, 16, YELLOW);
+    // Preserve both series wherever their rasterized traces share a cell.
+    // This includes equal values and values indistinguishable at terminal resolution.
+    for (x, y, active_overflow) in active_cells {
+        if frame.buffer_mut()[(x, y)].fg == YELLOW {
+            let overflow = active_overflow || frame.buffer_mut()[(x, y)].symbol() == "↑";
+            frame.buffer_mut()[(x, y)]
+                .set_symbol(if overflow { "↑" } else { "═" })
+                .set_fg(Color::White);
+        }
+    }
+    if active_values
+        .iter()
+        .chain(&waiting_values)
+        .all(Option::is_none)
+    {
+        frame.render_widget(
+            Paragraph::new("No queue samples").style(Style::default().fg(MUTED)),
+            graph,
         );
     }
 }
@@ -301,6 +340,73 @@ mod tests {
         sample.llm_requests[0].model = "other".into();
         history.observe(&sample, 10);
         assert_eq!(history.timings.len(), 2);
+    }
+
+    #[test]
+    fn stepped_trace_uses_connected_corners_for_rises_and_falls() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(3, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                trace(
+                    frame,
+                    frame.area(),
+                    &[Some(0), Some(16), Some(0)],
+                    &[false; 3],
+                    16,
+                    CYAN,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 4)].symbol(), "┛");
+        assert_eq!(buffer[(1, 0)].symbol(), "┏");
+        assert_eq!(buffer[(2, 0)].symbol(), "┓");
+        assert_eq!(buffer[(2, 4)].symbol(), "┗");
+    }
+
+    #[test]
+    fn zero_queue_series_share_labeled_baseline_and_keep_border_intact() {
+        let mut history = History::default();
+        for _ in 0..40 {
+            history.observe(&live(), 80);
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(44, 10)).unwrap();
+        terminal
+            .draw(|frame| queue(frame, frame.area(), &history, Duration::from_secs(1)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(40, 8)].symbol(), "═");
+        assert_eq!(buffer[(40, 8)].fg, Color::White);
+        assert_eq!(buffer[(1, 8)].symbol(), "0");
+        assert!((3..8).all(|y| buffer[(40, y)].symbol() == " "));
+        assert_eq!(buffer[(1, 9)].symbol(), "─");
+    }
+
+    #[test]
+    fn unequal_queue_counts_use_one_scale_and_missing_series_is_not_overlap() {
+        let mut history = History::default();
+        let mut sample = live();
+        sample.llm_active_requests = Some(8);
+        for _ in 0..40 {
+            history.observe(&sample, 80);
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(44, 10)).unwrap();
+        terminal
+            .draw(|frame| queue(frame, frame.area(), &history, Duration::from_secs(1)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(40, 5)].fg, CYAN);
+        assert_eq!(buffer[(40, 8)].fg, YELLOW);
+        history = History::default();
+        sample.llm_active_requests = None;
+        for _ in 0..40 {
+            history.observe(&sample, 80);
+        }
+        terminal
+            .draw(|frame| queue(frame, frame.area(), &history, Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(40, 8)].symbol(), "━");
+        assert_eq!(terminal.backend().buffer()[(40, 8)].fg, YELLOW);
     }
 
     #[test]
