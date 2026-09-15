@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1 — 2026-09-15
+
+- Fix disconnected corners in process-memory and queue traces.
+- Give active and waiting requests one labeled zero baseline. A white `═`
+  marks overlapping trace cells; exact counts and overflow remain visible.
+- Show explanatory messages instead of empty indicator plots when no samples
+  exist.
+- Shorten prompt insights in narrow panels and use fractional bar heights
+  when request cache counts are unknown.
+- Update the installer, downloads and documentation to v1.1.1.
+
 ## 1.1.0 — 2026-09-15
 
 ### Operator dashboard

@@ -15,11 +15,11 @@ your model responds.
 
 You’ll need an Apple Silicon Mac or a Linux machine and a terminal with
 Unicode and color support.
-The v1.1.0 binary targets macOS 11 or later and was tested on macOS 26.5.1.
-See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.1.0)
+The v1.1.1 binary targets macOS 11 or later and was tested on macOS 26.5.1.
+See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.1.1)
 for compatibility details.
 
-[**Download the macOS disk image (.dmg)**](https://github.com/maximpri/mlxtop/releases/download/v1.1.0/mlxtop-1.1.0-aarch64-apple-darwin.dmg).
+[**Download the macOS disk image (.dmg)**](https://github.com/maximpri/mlxtop/releases/download/v1.1.1/mlxtop-1.1.1-aarch64-apple-darwin.dmg).
 Open it, double-click **Install mlxtop.pkg**, and follow the installer. Then
 open Terminal and run `mlxtop`. This installs in `/usr/local/bin` and requires
 an administrator account. The package is unsigned and not Apple notarized.

@@ -20,7 +20,7 @@ That is a stronger position than becoming another general-purpose `top` clone.
 The product should remain local-first and read-only by default, combine provider
 telemetry with host evidence, and explain conclusions without inventing data.
 
-The current package version is 1.1.0, with documented Apple Silicon installation
+The current package version is 1.1.1, with documented Apple Silicon installation
 and useful macOS pressure analysis. The next development priorities are modular
 architecture, provider breadth, integration testing, and automated releases.
 
@@ -129,7 +129,7 @@ remain unset. The repository includes an MIT license, security policy,
 contributor guide, issue templates, a pull-request template, dependency license
 policy, and third-party notices.
 
-The README documents v1.1.0 installation. The DMG packaging script generates
+The README documents v1.1.1 installation. The DMG packaging script generates
 SHA-256 checksums, and the shell installer verifies them. A code of conduct, dedicated support policy, automated release workflow, SBOM generation,
 and build provenance remain future work.
 

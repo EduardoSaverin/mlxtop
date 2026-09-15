@@ -264,8 +264,8 @@ existing throughput and hardware charts.
 **Queue** plots active requests in cyan and waiting requests in yellow on one
 shared, labeled zero baseline. A white `═` marks overlapping trace cells,
 including equal values and values that coincide at terminal resolution. Exact
-counts remain in the header. Both series use a fixed scale of 0–16 requests, with `↑` for overflow and exact current counts
-in the header. Idle zeros are valid; stale, missing and client-reported values
+counts remain in the header. Both series use a fixed scale of 0–16 requests,
+with `↑` for overflow. Idle zeros are valid; stale, missing and client-reported values
 produce gaps. Queue length is a demand signal, not a latency measurement.
 
 **Process memory** plots the OS physical footprint against a fixed display
