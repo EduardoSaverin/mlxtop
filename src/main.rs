@@ -3097,6 +3097,19 @@ impl App {
             return;
         }
 
+        if history.iter().all(|point| point.value.is_none()) {
+            let message = match metric {
+                ChartMetric::Cache => "No interval cache data",
+                ChartMetric::Generation | ChartMetric::Prefill => "No live rate samples",
+                _ => "No samples available",
+            };
+            frame.render_widget(
+                Paragraph::new(message).style(Style::default().fg(MUTED)),
+                inner,
+            );
+            return;
+        }
+
         let plot_height = inner.height as usize;
         // Render the newest sample at the right edge and let older samples
         // leave from the left. Every displayed column maps to one captured
