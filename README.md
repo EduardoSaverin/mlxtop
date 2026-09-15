@@ -15,6 +15,7 @@ your model responds.
 
 You’ll need an Apple Silicon Mac or a Linux machine and a terminal with
 Unicode and color support.
+The source package is v1.1.0; the published download linked below is v1.0.0.
 The v1.0.0 binary targets macOS 11 or later and was tested on macOS 26.5.1.
 See the [release notes](https://github.com/maximpri/mlxtop/releases/tag/v1.0.0)
 for compatibility details.
