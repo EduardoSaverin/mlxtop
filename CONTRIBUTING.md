@@ -7,6 +7,10 @@ fixtures and focused implementation changes are all useful contributions.
 
 Run the local checks:
 
+macOS builds require Xcode Command Line Tools (including the macOS SDK and
+libclang) for the safe `libproc` wrapper's generated bindings. The application
+continues to forbid unsafe Rust in its own source.
+
 ~~~sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
@@ -22,6 +26,10 @@ For UI changes, test both the interactive dashboard and the static report:
 ~~~
 
 ## Design boundaries
+
+Follow the [UX design rules](docs/UX_DESIGN.md) for naming, typography, color,
+layout, metric semantics and interaction. Chart titles use lowercase words
+with acronyms preserved: `prompt load`, `generation`, `GPU`.
 
 - Keep Overview focused on current health and LLM impact.
 - Keep MLX Top focused on live process/resource inspection.

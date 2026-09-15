@@ -8,6 +8,11 @@
 //! the static report. Provider-specific telemetry is optional; missing data
 //! remains explicitly unavailable instead of being inferred.
 
+mod operator_charts;
+mod process_memory;
+mod providers;
+mod request_dashboard;
+
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::collections::VecDeque;
@@ -319,6 +324,7 @@ enum TelemetrySource {
     None,
     Live,
     Log,
+    Report,
 }
 
 impl TelemetrySource {
@@ -327,6 +333,7 @@ impl TelemetrySource {
             Self::None => "unavailable",
             Self::Live => "live API",
             Self::Log => "completion log",
+            Self::Report => "reported usage",
         }
     }
 }
@@ -345,7 +352,7 @@ enum EventKind {
 impl EventKind {
     fn from_state(state: &str) -> Self {
         match state {
-            "LLM" => Self::Llm,
+            "LLM" | "PROMPT" => Self::Llm,
             "QUEUE" => Self::Queue,
             "PRESSURE" | "MEMORY BOTTLENECK" | "MEMORY STRESS" => Self::Pressure,
             "PAGING" | "SWAP THRASHING" | "HEAVY PAGING" | "PAGE-IN RECOVERY" | "PAGING ACTIVE"
@@ -756,6 +763,7 @@ struct LlmTelemetry {
     prefill_tps_live: bool,
     output_tokens: Option<u64>,
     prompt_tokens: Option<u64>,
+    requests: Vec<providers::RequestUsage>,
     cache_efficiency: Option<f64>,
     prefix_hit_rate: Option<f64>,
     total_prompt_tokens: Option<u64>,
@@ -768,6 +776,7 @@ struct LlmTelemetry {
 }
 
 struct LlmTelemetryClient {
+    provider_adapter: providers::Adapter,
     host: String,
     port: u16,
     session_cookie: Option<String>,
@@ -810,6 +819,8 @@ struct Sample {
     thermal: String,
     llm_count: u32,
     llm_rss: u64,
+    process_memory: Option<process_memory::Reading>,
+    process_memory_growth: Option<i64>,
     llm_cpu: f64,
     llm_processes: Vec<LlmProcess>,
     largest_consumer: Option<String>,
@@ -824,6 +835,7 @@ struct Sample {
     llm_prefill_tps_live: bool,
     llm_output_tokens: Option<u64>,
     llm_prompt_tokens: Option<u64>,
+    llm_requests: Vec<providers::RequestUsage>,
     llm_cache_efficiency: Option<f64>,
     llm_cache_interval_efficiency: Option<f64>,
     llm_prefix_hit_rate: Option<f64>,
@@ -877,6 +889,8 @@ impl Default for Sample {
             thermal: "unavailable".into(),
             llm_count: 0,
             llm_rss: 0,
+            process_memory: None,
+            process_memory_growth: None,
             llm_cpu: 0.0,
             llm_processes: Vec::new(),
             largest_consumer: None,
@@ -891,6 +905,7 @@ impl Default for Sample {
             llm_prefill_tps_live: false,
             llm_output_tokens: None,
             llm_prompt_tokens: None,
+            llm_requests: Vec::new(),
             llm_cache_efficiency: None,
             llm_cache_interval_efficiency: None,
             llm_prefix_hit_rate: None,
@@ -934,6 +949,8 @@ struct CollectorView {
     swap_history: VecDeque<ChartPoint>,
     gpu_history: VecDeque<ChartPoint>,
     signals: VecDeque<SignalEvent>,
+    request_history: request_dashboard::History,
+    operator_history: operator_charts::History,
 }
 
 #[derive(Default)]
@@ -961,6 +978,7 @@ struct Collector {
     total_memory: u64,
     metal: MetalTelemetry,
     llm_client: LlmTelemetryClient,
+    seen_requests: VecDeque<(String, u64)>,
     correlation: CorrelationEngine,
     previous: Option<PreviousCounters>,
     previous_llm_cache: Option<CacheCounters>,
@@ -972,6 +990,8 @@ struct Collector {
     swap_history: VecDeque<ChartPoint>,
     gpu_history: VecDeque<ChartPoint>,
     signals: VecDeque<SignalEvent>,
+    request_history: request_dashboard::History,
+    operator_history: operator_charts::History,
     history_limit: usize,
 }
 
@@ -1123,6 +1143,7 @@ impl Collector {
             total_memory,
             metal,
             llm_client: LlmTelemetryClient::new(),
+            seen_requests: VecDeque::new(),
             correlation: CorrelationEngine::default(),
             previous: None,
             previous_llm_cache: None,
@@ -1134,6 +1155,8 @@ impl Collector {
             swap_history: VecDeque::with_capacity(history_limit),
             gpu_history: VecDeque::with_capacity(history_limit),
             signals: VecDeque::with_capacity(8),
+            request_history: request_dashboard::History::default(),
+            operator_history: operator_charts::History::default(),
             history_limit,
         }
     }
@@ -1236,6 +1259,10 @@ impl Collector {
             .as_ref()
             .map(|process| process.pid)
             .unwrap_or_default();
+        sample.process_memory = process_memory::read(sample.llm_pid);
+        sample.process_memory_growth = sample.process_memory.as_ref().and_then(|reading| {
+            process_memory::growth(reading, self.current.process_memory.as_ref())
+        });
         sample.llm_top = process_snapshot
             .top_llm
             .as_ref()
@@ -1247,8 +1274,12 @@ impl Collector {
             annotate_process_pagein_rates(&mut llm_processes, &self.current.llm_processes, elapsed);
         }
         sample.llm_processes = llm_processes;
-        let live_stats = self.llm_client.poll();
-        let should_read_log = live_stats.is_none()
+        let live_stats = self.llm_client.poll(detected_provider.as_deref());
+        let should_read_log = !self
+            .llm_client
+            .provider_adapter
+            .selected(detected_provider.as_deref())
+            && live_stats.is_none()
             && detected_provider
                 .as_deref()
                 .map(|provider| provider == "oMLX")
@@ -1261,7 +1292,11 @@ impl Collector {
         let llm_stats = live_stats.as_ref();
         sample.mlx = llm_stats.map(|stats| stats.mlx.clone()).unwrap_or_default();
         sample.metal.resource_limit = sample.metal.resource_limit.or(sample.mlx.resource_limit);
+        sample.llm_requests = llm_stats
+            .map(|stats| stats.requests.clone())
+            .unwrap_or_default();
         let live_is_stale = llm_stats
+            .filter(|stats| stats.source == TelemetrySource::Live)
             .and_then(|stats| stats.observed_at)
             .and_then(|observed_at| SystemTime::now().duration_since(observed_at).ok())
             .is_some_and(|age| age > Duration::from_secs(5));
@@ -1463,6 +1498,8 @@ impl Collector {
             swap_history: self.swap_history.clone(),
             gpu_history: self.gpu_history.clone(),
             signals: self.signals.clone(),
+            request_history: self.request_history.clone(),
+            operator_history: self.operator_history.clone(),
         }
     }
 
@@ -1471,6 +1508,15 @@ impl Collector {
         let mut add = |state: &str, summary: String, tone: Tone| {
             events.push((state.to_string(), summary, tone));
         };
+
+        self.request_history.observe(&sample.llm_requests);
+        self.operator_history.observe(sample, self.history_limit);
+        for request in &sample.llm_requests {
+            if let Some(summary) = providers::new_request_summary(&mut self.seen_requests, request)
+            {
+                add("PROMPT", summary, Tone::Cyan);
+            }
+        }
 
         if let Some(previous) = previous {
             if previous.impact != sample.impact && sample.impact != "SAMPLING" {
@@ -1705,6 +1751,9 @@ impl Collector {
     fn reset(&mut self) {
         self.previous = None;
         self.previous_llm_cache = None;
+        self.seen_requests.clear();
+        self.request_history = request_dashboard::History::default();
+        self.operator_history = operator_charts::History::default();
         self.correlation.reset();
         self.generation_history.clear();
         self.prefill_history.clear();
@@ -1755,6 +1804,7 @@ struct App {
     top_selected: usize,
     journal_filter: JournalFilter,
     journal_scroll: usize,
+    request_scroll: usize,
     help: bool,
     quit: bool,
     sampler_disconnected: bool,
@@ -1775,6 +1825,8 @@ impl App {
                 swap_history: VecDeque::new(),
                 gpu_history: VecDeque::new(),
                 signals: VecDeque::new(),
+                request_history: request_dashboard::History::default(),
+                operator_history: operator_charts::History::default(),
             },
             sampler: Sampler::spawn(interval, history),
             interval,
@@ -1786,6 +1838,7 @@ impl App {
             top_selected: 0,
             journal_filter: JournalFilter::All,
             journal_scroll: 0,
+            request_scroll: 0,
             help: false,
             quit: false,
             sampler_disconnected: false,
@@ -1939,6 +1992,26 @@ impl App {
                 _ => {}
             }
         }
+        if self.tab == 0 {
+            let last = self.collector.request_history.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Up => self.request_scroll = self.request_scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    self.request_scroll = self.request_scroll.saturating_add(1).min(last)
+                }
+                KeyCode::PageUp => self.request_scroll = self.request_scroll.saturating_sub(10),
+                KeyCode::PageDown => {
+                    self.request_scroll = self.request_scroll.saturating_add(10).min(last)
+                }
+                KeyCode::Home => self.request_scroll = 0,
+                KeyCode::End => self.request_scroll = last,
+                _ => {
+                    self.handle_global_key(key);
+                    return;
+                }
+            }
+            return;
+        }
         if self.tab == 2 {
             match key.code {
                 // The journal is newest-first: Up returns toward the live edge,
@@ -1980,6 +2053,10 @@ impl App {
                 _ => {}
             }
         }
+        self.handle_global_key(key);
+    }
+
+    fn handle_global_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('a') => {
@@ -1998,6 +2075,7 @@ impl App {
             KeyCode::Char('r') => {
                 self.sampler.send(SamplerCommand::Reset);
                 self.journal_scroll = 0;
+                self.request_scroll = 0;
                 self.journal_filter = JournalFilter::All;
                 self.alert = None;
             }
@@ -2119,9 +2197,9 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Min(if compact_tabs { 20 } else { 30 }),
+                Constraint::Min(if compact_tabs { 17 } else { 25 }),
                 Constraint::Length(if compact_tabs { 30 } else { 40 }),
-                Constraint::Min(if compact_tabs { 30 } else { 50 }),
+                Constraint::Min(if compact_tabs { 18 } else { 40 }),
             ])
             .split(area);
         let title = Paragraph::new(Line::from(vec![
@@ -2163,24 +2241,40 @@ impl App {
     }
 
     fn draw_overview(&self, frame: &mut Frame, area: Rect) {
+        if area.width >= 160 && area.height >= 32 {
+            let rows = Layout::vertical([Constraint::Length(12), Constraint::Min(20)]).split(area);
+            self.draw_operations_panel(frame, rows[0]);
+            self.draw_operator_grid(frame, rows[1]);
+            return;
+        }
         let operations_height = if area.width < 120 { 10 } else { 12 };
-        let chart_minimum = MIN_CHART_HEIGHT * CHART_GRID_ROWS;
-        let show_log = area.height >= operations_height + chart_minimum + 4;
+        let request_height = if area.width < 120 { 8 } else { 7 };
+        let chart_minimum = if area.height < 28 {
+            6
+        } else {
+            MIN_CHART_HEIGHT * CHART_GRID_ROWS
+        };
+        let show_log = area.height >= operations_height + request_height + chart_minimum + 4;
         let mut constraints = vec![
             Constraint::Length(operations_height),
+            Constraint::Length(request_height),
             Constraint::Min(chart_minimum),
         ];
         if show_log {
             constraints.push(Constraint::Length(4));
         }
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
+        let rows = Layout::vertical(constraints).split(area);
         self.draw_operations_panel(frame, rows[0]);
-        self.draw_trend_strip(frame, rows[1]);
+        request_dashboard::draw(
+            frame,
+            rows[1],
+            &self.collector.request_history,
+            &self.collector.current,
+            self.request_scroll,
+        );
+        self.draw_trend_strip(frame, rows[2]);
         if show_log {
-            self.draw_signal_log(frame, rows[2]);
+            self.draw_signal_log(frame, rows[3]);
         }
         if self.collector.current.total_memory == 0 && self.collector.current.updated != "waiting" {
             frame.render_widget(
@@ -2188,6 +2282,94 @@ impl App {
                     .style(Style::default().fg(YELLOW)),
                 area,
             );
+        }
+    }
+
+    fn draw_operator_grid(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::vertical([
+            Constraint::Length(8),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+        let top = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+        ])
+        .split(rows[0]);
+        request_dashboard::draw(
+            frame,
+            top[0],
+            &self.collector.request_history,
+            &self.collector.current,
+            self.request_scroll,
+        );
+        self.render_indicator_chart(
+            frame,
+            top[1],
+            "generation",
+            &self.collector.generation_history,
+            ChartMetric::Generation,
+        );
+        self.render_indicator_chart(
+            frame,
+            top[2],
+            "prefill",
+            &self.collector.prefill_history,
+            ChartMetric::Prefill,
+        );
+        let middle = Layout::horizontal([Constraint::Fill(1); 4]).split(rows[1]);
+        operator_charts::footprint(
+            frame,
+            middle[0],
+            &self.collector.operator_history,
+            &self.collector.current,
+        );
+        operator_charts::queue(
+            frame,
+            middle[1],
+            &self.collector.operator_history,
+            self.interval,
+        );
+        self.render_indicator_chart(
+            frame,
+            middle[2],
+            "GPU",
+            &self.collector.gpu_history,
+            ChartMetric::Gpu,
+        );
+        self.render_indicator_chart(
+            frame,
+            middle[3],
+            "system memory",
+            &self.collector.load_history,
+            ChartMetric::Memory,
+        );
+        let bottom = Layout::horizontal([
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(50),
+        ])
+        .split(rows[2]);
+        self.render_indicator_chart(
+            frame,
+            bottom[0],
+            "paging",
+            &self.collector.swap_history,
+            ChartMetric::Swap,
+        );
+        self.render_indicator_chart(
+            frame,
+            bottom[1],
+            "cache",
+            &self.collector.cache_history,
+            ChartMetric::Cache,
+        );
+        if self.collector.operator_history.has_latency() {
+            operator_charts::latency(frame, bottom[2], &self.collector.operator_history);
+        } else {
+            self.draw_signal_log(frame, bottom[2]);
         }
     }
 
@@ -2372,10 +2554,10 @@ impl App {
                 ]),
                 Line::from(Span::styled(
                     format!(
-                        "CONTEXT {} · OUT {} · PROMPT {}",
-                        llm_context_label(s),
+                        "PROMPT {} · OUT {} · CONTEXT {}",
+                        optional_tokens(s.llm_prompt_tokens),
                         optional_tokens(s.llm_output_tokens),
-                        optional_tokens(s.llm_prompt_tokens)
+                        llm_context_label(s)
                     ),
                     Style::default().fg(MUTED),
                 )),
@@ -2390,7 +2572,11 @@ impl App {
                     Style::default().fg(CYAN),
                 )),
                 Line::from(Span::styled(
-                    mlx_runtime_summary(&s.mlx),
+                    process_memory::summary(s),
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    process_memory::detail(s),
                     Style::default().fg(MUTED),
                 )),
             ],
@@ -2707,8 +2893,8 @@ impl App {
                 Span::styled(
                     compact_label(
                         &format!(
-                            "CONTEXT {} · CACHE {} · REQ {}/{}",
-                            llm_context_label(sample),
+                            "PROMPT {} · CACHE {} · REQ {}/{}",
+                            optional_tokens(sample.llm_prompt_tokens),
                             percent(sample.llm_cache_efficiency),
                             count(sample.llm_active_requests),
                             count(sample.llm_waiting_requests),
@@ -2764,7 +2950,7 @@ impl App {
     fn render_indicator_charts(&self, frame: &mut Frame, area: Rect) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .constraints([Constraint::Fill(1); 3])
             .split(area);
         for (row, series) in rows.iter().zip([
             [
@@ -2797,6 +2983,27 @@ impl App {
             for (column, (name, history, metric)) in columns.iter().zip(series) {
                 self.render_indicator_chart(frame, *column, name, history, metric);
             }
+        }
+        let extra = Layout::horizontal(if self.collector.operator_history.has_latency() {
+            vec![Constraint::Fill(1); 3]
+        } else {
+            vec![Constraint::Fill(1); 2]
+        })
+        .split(rows[2]);
+        operator_charts::footprint(
+            frame,
+            extra[0],
+            &self.collector.operator_history,
+            &self.collector.current,
+        );
+        operator_charts::queue(
+            frame,
+            extra[1],
+            &self.collector.operator_history,
+            self.interval,
+        );
+        if extra.len() == 3 {
+            operator_charts::latency(frame, extra[2], &self.collector.operator_history);
         }
     }
 
@@ -2853,13 +3060,15 @@ impl App {
                 window,
                 axis_label
             )
-        } else {
+        } else if area.width >= 52 {
             format!(
                 "  · avg {} · peak {} · {}",
                 chart_stat_label(metric, average),
                 chart_stat_label(metric, peak),
                 window
             )
+        } else {
+            format!(" · {window}")
         };
         let title = Line::from(vec![
             Span::styled(
@@ -3257,10 +3466,10 @@ impl App {
                     ]),
                     Line::from(Span::styled(
                         format!(
-                            "CONTEXT {} · OUT {} · PROMPT {}",
-                            llm_context_label(sample),
+                            "PROMPT {} · OUT {} · CONTEXT {}",
+                            optional_tokens(sample.llm_prompt_tokens),
                             optional_tokens(sample.llm_output_tokens),
-                            optional_tokens(sample.llm_prompt_tokens)
+                            llm_context_label(sample)
                         ),
                         Style::default().fg(MUTED),
                     )),
@@ -3275,7 +3484,11 @@ impl App {
                         Style::default().fg(CYAN),
                     )),
                     Line::from(Span::styled(
-                        mlx_runtime_summary(&sample.mlx),
+                        process_memory::summary(sample),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(Span::styled(
+                        process_memory::detail(sample),
                         Style::default().fg(MUTED),
                     )),
                 ],
@@ -3710,6 +3923,7 @@ impl App {
         let compact = area.width < 60;
         let hints = match (self.tab, compact) {
             (1, true) => vec![("↑↓", "select"), ("/", "filter"), ("q", "quit")],
+            (0, _) => vec![("p", "pause"), ("↑↓", "history"), ("q", "quit")],
             (2, true) => vec![("↑↓", "scroll"), ("f", "filter"), ("q", "quit")],
             (_, true) => vec![("p", "pause"), ("?", "help"), ("q", "quit")],
             (1, false) => vec![
@@ -3784,7 +3998,7 @@ impl App {
                 "Alerts             aggressive paging rings the terminal bell and shows a banner",
             ),
             Line::from("Tab / ← →          cycle Overview, MLX Top, and Journal"),
-            Line::from("1 / 2 / 3          jump to Overview, MLX Top, or Journal"),
+            Line::from("1 / 2 / 3          Overview / MLX Top / Journal"),
             Line::from(
                 "MLX Top            live process/resource monitor: PID, CPU, MEM%, RSS, PAGEIN/s, state, model",
             ),
@@ -3794,6 +4008,7 @@ impl App {
             Line::from("Journal            historical transitions only: what changed and why"),
             Line::from("↑ / PgUp / Home newer; ↓ / PgDn / End older in the Journal"),
             Line::from("f / [ / ]          cycle Journal event filters"),
+            Line::from("Overview: ↑↓ request history; Home newest; End oldest"),
             Line::from("+ / -              change refresh interval (1–60s)"),
             Line::from("? / h              close this help"),
             Line::from(""),
@@ -4577,7 +4792,7 @@ fn llm_rate_label(sample: &Sample, metric: &str, value: Option<f64>, live: bool)
     } else if value.is_some() {
         match sample.llm_source {
             TelemetrySource::Live => format!("AVG {metric}"),
-            TelemetrySource::Log => format!("LAST {metric}"),
+            TelemetrySource::Log | TelemetrySource::Report => format!("LAST {metric}"),
             TelemetrySource::None => metric.to_owned(),
         }
     } else {
@@ -4634,24 +4849,19 @@ fn optional_tokens(value: Option<u64>) -> String {
 }
 
 fn mlx_runtime_summary(mlx: &MlxTelemetry) -> String {
-    let mut parts = vec![mlx
-        .version
-        .as_deref()
-        .map(|version| format!("MLX v{version}"))
-        .unwrap_or_else(|| "MLX runtime".into())];
-    if let Some(value) = mlx.active_memory {
-        parts.push(format!("active {}", bytes(value)));
+    let counters: Vec<_> = [
+        ("active", mlx.active_memory),
+        ("cache", mlx.cache_memory),
+        ("peak", mlx.peak_memory),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| value.map(|value| format!("{label} {}", bytes(value))))
+    .collect();
+    if counters.is_empty() {
+        String::new()
+    } else {
+        format!("MLX {}", counters.join(" · "))
     }
-    if let Some(value) = mlx.cache_memory {
-        parts.push(format!("cache {}", bytes(value)));
-    }
-    if let Some(value) = mlx.peak_memory {
-        parts.push(format!("peak {}", bytes(value)));
-    }
-    if parts.len() == 1 {
-        parts.push("allocator counters not exposed".into());
-    }
-    parts.join(" · ")
 }
 
 fn llm_context_label(sample: &Sample) -> String {
@@ -4746,6 +4956,7 @@ fn telemetry_source(sample: &Sample) -> String {
             }
         }
         TelemetrySource::Log => format!("LOG {}", telemetry_age(sample.llm_observed_at)),
+        TelemetrySource::Report => format!("REPORTED {}", telemetry_age(sample.llm_observed_at)),
         TelemetrySource::None => "SOURCE —".into(),
     }
 }
@@ -5817,7 +6028,8 @@ fn process_provider(name: &str, command: &str) -> Option<String> {
         "KoboldCpp"
     } else if executable.contains("localai") || command.contains("localai") {
         "LocalAI"
-    } else if executable.contains("mlx") || command.contains("mlx-lm") {
+    } else if executable.contains("mlx") || command.contains("mlx-lm") || command.contains("mlx_lm")
+    {
         "mlx-lm"
     } else {
         return None;
@@ -5829,6 +6041,7 @@ impl LlmTelemetryClient {
     fn new() -> Self {
         let (host, port) = read_omlx_endpoint();
         Self {
+            provider_adapter: providers::Adapter::new(),
             host,
             port,
             session_cookie: None,
@@ -5841,7 +6054,10 @@ impl LlmTelemetryClient {
         }
     }
 
-    fn poll(&mut self) -> Option<LlmTelemetry> {
+    fn poll(&mut self, detected_provider: Option<&str>) -> Option<LlmTelemetry> {
+        if self.provider_adapter.selected(detected_provider) {
+            return self.provider_adapter.poll();
+        }
         let now = Instant::now();
         if now < self.next_poll {
             return self.cached.clone();
@@ -6173,6 +6389,7 @@ fn parse_omlx_telemetry(health: &Value, stats: Option<&Value>) -> LlmTelemetry {
     telemetry.prefill_tps = json_f64(stats, &["avg_prefill_tps"]).filter(|value| *value >= 0.0);
     telemetry.cache_efficiency =
         json_f64(stats, &["cache_efficiency"]).map(|value| value.clamp(0.0, 100.0));
+    telemetry.requests = providers::omlx_requests(stats);
     telemetry.total_prompt_tokens = json_u64(stats, &["total_prompt_tokens"]);
     telemetry.total_cached_tokens = json_u64(stats, &["total_cached_tokens"]);
     telemetry.model_memory =
@@ -7116,6 +7333,27 @@ fn print_static(sample: &Sample, interval: u64) {
         percent(sample.llm_cache_efficiency)
     );
     println!(
+        "TOKENS       PROMPT {} · OUT {}",
+        optional_tokens(sample.llm_prompt_tokens),
+        optional_tokens(sample.llm_output_tokens)
+    );
+    for request in &sample.llm_requests {
+        println!("REQUEST      {}", request.summary());
+    }
+    if let Some(memory) = &sample.process_memory {
+        println!(
+            "PROCESS OS   pid {} · footprint {} · lifetime peak {} · RSS {} · growth {}",
+            memory.pid,
+            bytes(memory.footprint),
+            bytes(memory.peak),
+            bytes(memory.resident),
+            sample
+                .process_memory_growth
+                .map(signed_rate)
+                .unwrap_or_else(|| "—".into())
+        );
+    }
+    println!(
         "MLX          version {} · active {} · cache {} · peak {}",
         sample.mlx.version.as_deref().unwrap_or("—"),
         optional_bytes(sample.mlx.active_memory),
@@ -7376,6 +7614,8 @@ mod tests {
                 swap_history: VecDeque::new(),
                 gpu_history: VecDeque::new(),
                 signals: VecDeque::new(),
+                request_history: request_dashboard::History::default(),
+                operator_history: operator_charts::History::default(),
             },
             sampler: Sampler {
                 commands,
@@ -7391,6 +7631,7 @@ mod tests {
             top_selected: 0,
             journal_filter: JournalFilter::All,
             journal_scroll: 0,
+            request_scroll: 0,
             help: false,
             quit: false,
             sampler_disconnected: false,
@@ -7414,6 +7655,8 @@ mod tests {
             swap_history: VecDeque::new(),
             gpu_history: VecDeque::new(),
             signals: VecDeque::new(),
+            request_history: request_dashboard::History::default(),
+            operator_history: operator_charts::History::default(),
         }
     }
 
@@ -7609,7 +7852,8 @@ mod tests {
             "generation",
             "prefill",
             "cache",
-            "avg",
+            "queue",
+            "process memory",
             "pause",
         ] {
             assert!(rendered.contains(label), "missing rendered label: {label}");
@@ -7746,6 +7990,192 @@ mod tests {
 
         assert!(rendered.contains('━'));
         assert!(!rendered.contains('⠁'));
+    }
+
+    #[test]
+    fn operator_grid_shows_available_metrics_and_conditionally_shows_latency() {
+        let mut app = test_app(0);
+        app.collector.current = Sample {
+            total_memory: 32 * 1024 * 1024 * 1024,
+            llm_provider: "oMLX".into(),
+            llm_source: TelemetrySource::Live,
+            llm_status: "generating".into(),
+            llm_observed_at: Some(SystemTime::now()),
+            llm_active_requests: Some(2),
+            llm_waiting_requests: Some(1),
+            ..Sample::default()
+        };
+        for i in 0..40 {
+            app.collector.current.process_memory = Some(process_memory::Reading {
+                pid: 37966,
+                started: 1,
+                resident: 16 * 1024 * 1024 * 1024,
+                footprint: (12 + i / 10) * 1024 * 1024 * 1024,
+                peak: 29 * 1024 * 1024 * 1024,
+                at: Instant::now(),
+            });
+            app.collector
+                .operator_history
+                .observe(&app.collector.current, 120);
+            app.collector
+                .generation_history
+                .push_back(ChartPoint::new(Some(280), Tone::Cyan));
+            app.collector
+                .prefill_history
+                .push_back(ChartPoint::new(Some(1560), Tone::Cyan));
+            app.collector
+                .gpu_history
+                .push_back(ChartPoint::new(Some(70), Tone::Green));
+            app.collector
+                .load_history
+                .push_back(ChartPoint::new(Some(58), Tone::Green));
+            app.collector
+                .swap_history
+                .push_back(ChartPoint::new(Some(0), Tone::Green));
+            app.collector
+                .cache_history
+                .push_back(ChartPoint::new(Some(50), Tone::Cyan));
+        }
+        for (i, prompt) in [22000, 23000, 12000, 10000, 18000, 24000, 40000]
+            .into_iter()
+            .enumerate()
+        {
+            app.collector.current.llm_requests = vec![providers::RequestUsage {
+                provider: "oMLX".into(),
+                model: "test".into(),
+                id: i.to_string(),
+                prompt,
+                cached: Some(prompt * 3 / 4),
+                output: Some(100),
+                completed: false,
+                observed_at: Some(SystemTime::now()),
+                ttft_ms: None,
+            }];
+            app.collector
+                .request_history
+                .observe(&app.collector.current.llm_requests);
+            app.collector
+                .operator_history
+                .observe(&app.collector.current, 120);
+        }
+        for (width, height) in [(180, 46), (100, 40)] {
+            let screen = render_app(&app, width, height);
+            for label in [
+                "prompt load",
+                "process memory",
+                "queue",
+                "generation",
+                "prefill",
+                "paging",
+                "cache",
+            ] {
+                assert!(
+                    screen.contains(label),
+                    "missing {label} at {width}x{height}"
+                );
+            }
+            assert!(!screen.contains("first token"));
+        }
+        app.collector.current.llm_requests[0].ttft_ms = Some(1250);
+        app.collector
+            .operator_history
+            .observe(&app.collector.current, 120);
+        let screen = render_app(&app, 180, 46);
+        assert!(screen.contains("first token"));
+        assert!(screen.contains("1250 ms"));
+        assert!(screen.contains("REPORTED"));
+    }
+
+    #[test]
+    fn overview_labels_os_process_memory_and_growth() {
+        let mut app = test_app(0);
+        app.collector.current.process_memory = Some(process_memory::Reading {
+            pid: 37966,
+            started: 1,
+            resident: 16 * 1024 * 1024 * 1024,
+            footprint: 17 * 1024 * 1024 * 1024,
+            peak: 29 * 1024 * 1024 * 1024,
+            at: Instant::now(),
+        });
+        app.collector.current.process_memory_growth = Some(-1024 * 1024);
+        let screen = render_app(&app, 180, 50);
+        for label in [
+            "PROCESS 37966",
+            "footprint 17.0 GiB",
+            "peak 29.0 GiB",
+            "growth -1.0 MiB/s",
+            "OS",
+        ] {
+            assert!(screen.contains(label), "missing {label}");
+        }
+        app.collector.current.process_memory = None;
+        let screen = render_app(&app, 180, 50);
+        assert!(!screen.contains("PROCESS 37966"));
+        assert!(!screen.contains("growth -1.0 MiB/s"));
+    }
+
+    #[test]
+    fn requests_dashboard_renders_counts_history_and_empty_state() {
+        let mut app = test_app(0);
+        let empty = render_app(&app, 80, 24);
+        assert!(empty.contains("No per-request counts received"));
+        for (i, prompt) in [12000, 20000, 32768].into_iter().enumerate() {
+            app.collector
+                .request_history
+                .observe(&[providers::RequestUsage {
+                    provider: "oMLX".into(),
+                    model: "test-model".into(),
+                    id: format!("req-{i}"),
+                    prompt,
+                    cached: Some(prompt / 2),
+                    output: Some(40),
+                    completed: true,
+                    ttft_ms: None,
+                    observed_at: Some(SystemTime::now()),
+                }]);
+        }
+        for (width, height) in [(80, 24), (100, 40), (180, 50)] {
+            let screen = render_app(&app, width, height);
+            for label in ["prompt load", "32,768", "CACHE", "PREVIOUS OBSERVED"] {
+                assert!(
+                    screen.contains(label),
+                    "missing {label} at {width}x{height}"
+                );
+            }
+        }
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.request_scroll, 2);
+        let older = render_app(&app, 80, 24);
+        assert!(older.contains("12,000"));
+        assert!(!older.contains("20,000"));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.request_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.tab, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(app.tab, 1);
+        assert!(!render_app(&app, 100, 40).contains("4 REQ"));
+    }
+
+    #[test]
+    fn prompt_counts_are_visible_and_request_events_use_the_llm_filter() {
+        let mut app = test_app(0);
+        app.collector.current.llm_prompt_tokens = Some(32768);
+        for (width, height) in [(80, 24), (100, 40), (180, 50)] {
+            let rendered = render_app(&app, width, height);
+            assert!(
+                rendered.contains("PROMPT 32.8k"),
+                "prompt missing at {width}x{height}"
+            );
+        }
+        assert!(JournalFilter::Llm.matches(EventKind::from_state("PROMPT")));
+        let reported = Sample {
+            llm_source: TelemetrySource::Report,
+            llm_generation_tps: Some(30.0),
+            ..Sample::default()
+        };
+        assert!(llm_generation_rate_label(&reported).starts_with("LAST GEN"));
+        assert_eq!(chart_rate_value(&reported, ChartMetric::Generation), None);
     }
 
     #[test]
