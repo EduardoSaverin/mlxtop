@@ -331,7 +331,10 @@ The dashboard selects one provider; it does not merge unrelated servers.
   a complete request history, and a new active request does not make the previous
   completion's rates live.
 - **llama-server:** reads `/slots`; optional `/metrics` supplies aggregate average
-  rates when the server starts with `--metrics`. Slot capacity, processed prefill
+  rates and active/deferred queue counts when the server starts with `--metrics`.
+  Either endpoint can work independently. Output counts sum all active slots;
+  if any active slot omits its output count, the total stays unavailable.
+  Slot capacity, processed prefill
   work and retained context are not treated as full request prompt counts. Use
   the usage-file integration below for exact completion usage.
 - **MLX-LM, Ollama, LM Studio and LocalAI:** their response usage needs client
@@ -347,8 +350,17 @@ local JSONL file, then launch mlxtop with:
 MLXTOP_USAGE_FILE=/absolute/path/usage.jsonl ./target/release/mlxtop
 ```
 
-The file takes priority over native polling. mlxtop only reads it; your client
-must write the records. Each record requires `provider`, a unique `request_id`,
+For llama-server, the file supplements native polling: completed requests appear
+in prompt history while live slots and queue counts remain available. Completed
+prompt counts are never combined with an active slot's output to estimate context.
+For other runtimes, valid file records take priority over native last-result
+reports (and over oMLX polling). An empty or invalid file does not disable
+llama-server or KoboldCpp polling.
+
+mlxtop only reads the file; your client must write the records. Explicit or
+detected provider selection filters the file to that runtime. If no runtime is
+selected, the newest valid record selects the provider for that refresh.
+Each record requires `provider`, a unique `request_id`,
 `observed_at` (completion time as Unix seconds), and token counts. `model` is
 optional. Example shape (replace the timestamp with the completion time):
 
@@ -365,23 +377,73 @@ Copy only usage counters from the response, with the required envelope above:
 | Response format | Counter fields |
 | --- | --- |
 | OpenAI-compatible usage, including MLX-LM | `usage.prompt_tokens`, `usage.completion_tokens`, optional `usage.prompt_tokens_details.cached_tokens` |
+| Responses-style usage | `usage.input_tokens`, `usage.output_tokens`, optional `usage.input_tokens_details.cached_tokens` |
 | Ollama native | `prompt_eval_count`, `eval_count` at record top level |
-| LM Studio native | `stats.input_tokens`, `stats.total_output_tokens` |
+| LM Studio native | `stats.input_tokens`, `stats.total_output_tokens`; `model_instance_id` is accepted as the model |
 
 For MLX-LM streaming, request `stream_options: {"include_usage": true}` and copy
 the final usage chunk. Other streaming APIs may likewise require usage to be
 enabled. Do not include prompts, messages, generated text, request bodies or keys
 in this file. Use opaque request IDs, unique across server restarts.
 
+The repository includes a standard-library Python helper, `scripts/record_usage.py`.
+Call it from your existing client after a completion:
+
+```python
+from scripts.record_usage import append_usage
+
+# response is the final response dictionary from your existing API call.
+append_usage("/absolute/path/usage.jsonl", "ollama", response)
+```
+
+It accepts the response formats in the table for every listed provider. For SDK
+objects, pass their dictionary representation (for example, `model_dump()`).
+For streaming, pass only the final usage-bearing chunk, or LM Studio's final
+aggregated response. The helper generates a unique request ID and completion
+timestamp; pass `request_id`, `observed_at`, `model` or measured `ttft_ms` explicitly
+when needed. When importing a saved response, supply its original completion
+time rather than treating the import time as the completion time.
+
+Alternatively, pipe a completed JSON response to the helper:
+
+```sh
+python3 scripts/record_usage.py --provider mlx-lm \
+  --file /absolute/path/usage.jsonl < completed-response.json
+MLXTOP_PROVIDER=mlx-lm MLXTOP_USAGE_FILE=/absolute/path/usage.jsonl mlxtop
+```
+
+The helper writes only allowlisted identifiers, counters and explicit timing.
+It excludes messages, generated content, reasoning, tool results and keys. New
+files have mode `0600`; cooperating writers use a file lock. It neither proxies
+requests nor changes a serving runtime. Python is needed only for this optional
+helper, not for mlxtop itself.
+
 Only newline-terminated records are read. Invalid records are skipped, missing
 counts remain unavailable, and future timestamps are rejected. Reading is bounded
-to the last 256 KiB and at most 128 recent valid records. The original timestamp
+to the last 256 KiB and at most 128 distinct recent requests for the selected
+provider. Duplicate provider/model/request IDs retain their last file record.
+The original timestamp
 is retained on every refresh; polling an old file does not make its data live.
 To retain every completion, the client should keep its own usage history. mlxtop's
 sampled journal is not an accounting ledger.
 
 Prompt differences are not labeled as conversation growth: provider request IDs
 do not establish that successive requests belong to the same tool loop.
+
+### Runtime detection and endpoint references
+
+Process detection includes Python's `-m mlx_lm.server`, `KoboldCpp.py`, `local-ai`,
+LM Studio desktop/engine paths and its `llmster` daemon. If several runtimes are
+running, use `MLXTOP_PROVIDER` to choose which provider supplies telemetry.
+Detection alone does not expose request tokens from process memory.
+
+The adapters follow the upstream [llama-server monitoring API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+and [KoboldCpp performance endpoint](https://github.com/LostRuins/koboldcpp/blob/concedo/koboldcpp.py).
+Client formats are documented by [MLX-LM](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/SERVER.md),
+[Ollama](https://docs.ollama.com/api/usage), and
+[LM Studio](https://lmstudio.ai/docs/developer/rest/chat).
+Native adapters target a single loopback server, without authentication;
+llama-server router mode and authenticated monitoring endpoints are not supported.
 
 ## Data sources and privacy
 

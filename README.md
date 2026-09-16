@@ -6,7 +6,7 @@ See which models are running, how much memory they use, and how busy your Mac’
 GPU is. With oMLX, you can also follow generation speed and request activity as
 your model responds.
 
-![mlxtop Overview showing a running model, response speed, memory use, and GPU activity](docs/screenshots/overview.jpg)
+![mlxtop v1.1.1 Overview showing per-request prompt load, generation and prefill rates, process memory, queue activity, GPU use, and recent events](docs/screenshots/overview.png)
 
 [Try it](#try-it) · [Runtime support](#runtime-support-and-limitations) ·
 [User guide](docs/USER_GUIDE.md) · [Changelog](CHANGELOG.md) · [Report a bug](https://github.com/maximpri/mlxtop/issues)
@@ -86,7 +86,7 @@ larger model or work through a longer conversation.
 
 | View | What it shows |
 | --- | --- |
-| Overview | Model status, response speed when available, memory use, and GPU activity |
+| Overview | Model status, per-request prompt load, generation and prefill rates when available, process memory, queue activity, and GPU use |
 | MLX Top | Running model processes and the resources they use |
 | Journal | Request activity and changes in resource use during the session |
 
@@ -141,9 +141,9 @@ as unavailable. Build from source with `cargo install --path . --locked`.
 | Runtime | Available information |
 | --- | --- |
 | oMLX | Models, processes, prompt and response speed, requests, cache activity, and extra memory counters when available |
-| llama.cpp / llama-server | Active slots and output counts; average rates when `/metrics` is enabled. Full prompt counts through the optional usage file. |
+| llama.cpp / llama-server | Active slots and summed output counts; average rates and active/deferred queue counts when `/metrics` is enabled. Optional usage file adds full prompt history alongside native polling. |
 | KoboldCpp | Last reported input/output counts and rates through `/api/extra/perf` |
-| MLX-LM, Ollama, LM Studio, LocalAI | Process detection; completed request counts through an optional client-written usage file |
+| MLX-LM, Ollama, LM Studio, LocalAI | Process detection (including Python entrypoints and LM Studio's `llmster`); completed request counts through an optional client-written usage file |
 
 Overview integrates prompt load with generation and prefill on wide terminals.
 It shows the latest count, change from the previous observed request, freshness,
@@ -155,7 +155,9 @@ Prompt counts also appear in the static report. Journal records each
 observed request with its prompt count and request-specific cached count when
 available. Polling is sampled: requests that finish between polls can be missed.
 See [request telemetry setup](docs/USER_GUIDE.md#request-token-telemetry) for
-provider selection, custom ports and response-only integrations.
+provider selection, custom ports and response-only integrations. The optional
+[Python client helper](scripts/record_usage.py) extracts counters from completed
+responses and appends them to the usage file without storing response content.
 
 The oMLX connection defaults to `127.0.0.1:8080` and reads settings from
 `~/.config/omlx-coding/server.env`. If you’re missing live readings, check the
