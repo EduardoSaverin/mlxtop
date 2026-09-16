@@ -18,7 +18,6 @@ readonly -a DEPLOY_PATHS=(
   Cargo.toml
   Cargo.lock
   src
-  mlxtop.sh
 )
 
 remote_host="${REMOTE_HOST:-${DEPLOY_HOST:-}}"
@@ -350,7 +349,6 @@ fi
 "$binary" --help >/dev/null
 chmod 755 "$binary"
 if ((build_on_remote)); then
-  chmod 755 "$stage_dir/mlxtop.sh"
   printf '%s\n' "$release_id" > "$stage_dir/.release"
 fi
 mv "$stage_dir" "$release_dir"

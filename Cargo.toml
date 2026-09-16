@@ -20,7 +20,6 @@ include = [
   "/CONTRIBUTING.md",
   "/SECURITY.md",
   "/THIRD_PARTY_NOTICES.md",
-  "/mlxtop.sh",
 ]
 
 [dependencies]
