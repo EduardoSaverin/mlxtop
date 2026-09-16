@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Keep llama-server live telemetry alongside client-reported prompt history;
+  poll slots and metrics independently and sum output across all active slots.
+- Read llama-server active/deferred queue gauges without treating average rates
+  as live generation speed.
+- Recognize runtime entrypoints consistently, including MLX-LM Python modules,
+  KoboldCpp scripts, LocalAI and LM Studio's headless daemon.
+- Filter usage files by provider, deduplicate request IDs and accept
+  Responses-style usage and LM Studio model instance identifiers.
+- Add a tested counters-only Python client helper with concurrent append support.
+- Distinguish KoboldCpp generation IDs after an observed uptime reset.
+
 ## 1.1.1 — 2026-09-15
 
 - Fix disconnected corners in process-memory and queue traces.

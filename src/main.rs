@@ -90,16 +90,6 @@ const DIAGNOSTICS_LOG_ENV: &str = "MLXTOP_LOG_PATH";
 const DIAGNOSTICS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_OMLX_HOST: &str = "127.0.0.1";
 const DEFAULT_OMLX_PORT: u16 = 8080;
-const LLM_PROCESS_MARKERS: &[&str] = &[
-    "omlx",
-    "mlx-lm",
-    "ollama",
-    "llama-server",
-    "llama.cpp",
-    "lm studio",
-    "koboldcpp",
-    "localai",
-];
 
 static DIAGNOSTICS: OnceLock<Diagnostics> = OnceLock::new();
 
@@ -5399,8 +5389,8 @@ fn llm_context_tokens(sample: &Sample) -> Option<u64> {
     match (sample.llm_prompt_tokens, sample.llm_output_tokens) {
         (Some(prompt), Some(output)) => Some(prompt.saturating_add(output)),
         (Some(prompt), None) => Some(prompt),
-        (None, Some(output)) => Some(output),
-        (None, None) => None,
+        // Output alone (including summed llama-server slots) is not context.
+        (None, _) => None,
     }
 }
 
@@ -5938,7 +5928,7 @@ fn parse_processes(text: &str) -> ProcessSnapshot {
         let is_llm = is_llm_process(&name, &command);
         if is_llm {
             if provider.is_none() {
-                provider = process_provider(&name, &lower);
+                provider = process_provider(&name, &command);
             }
             llm_count += 1;
             llm_rss += rss_kib * 1024;
@@ -6004,15 +5994,7 @@ fn annotate_process_pagein_rates(
 }
 
 fn is_llm_process(name: &str, command: &str) -> bool {
-    LLM_PROCESS_MARKERS.iter().any(|marker| {
-        let marker = normalize_process_token(marker);
-        std::iter::once(name)
-            .chain(command.split_whitespace().take(4))
-            .any(|candidate| {
-                let candidate = normalize_process_token(candidate);
-                !candidate.contains("mlxtop") && candidate.contains(&marker)
-            })
-    })
+    process_provider(name, command).is_some()
 }
 
 fn normalize_process_token(value: &str) -> String {
@@ -6028,21 +6010,36 @@ fn normalize_process_token(value: &str) -> String {
 }
 
 fn process_provider(name: &str, command: &str) -> Option<String> {
-    let executable = name.to_ascii_lowercase();
-    let provider = if executable.contains("omlx") || command.contains("omlx") {
-        "oMLX"
-    } else if executable.contains("ollama") || command.contains("ollama") {
-        "Ollama"
-    } else if executable.contains("llama") || command.contains("llama-server") {
-        "llama.cpp"
-    } else if executable.contains("lmstudio") || command.contains("lm studio") {
-        "LM Studio"
-    } else if executable.contains("kobold") || command.contains("koboldcpp") {
-        "KoboldCpp"
-    } else if executable.contains("localai") || command.contains("localai") {
-        "LocalAI"
-    } else if executable.contains("mlx") || command.contains("mlx-lm") || command.contains("mlx_lm")
+    let command_tokens = command
+        .split_whitespace()
+        .take(4)
+        .take_while(|token| !token.starts_with("--"))
+        .collect::<Vec<_>>();
+    let prefix = command_tokens.join(" ").to_ascii_lowercase();
+    let candidates: Vec<_> = std::iter::once(name)
+        .chain(command_tokens.iter().copied())
+        .map(normalize_process_token)
+        .filter(|token| !token.contains("mlxtop"))
+        .collect();
+    let has = |marker: &str| candidates.iter().any(|token| token.contains(marker));
+    // LM Studio can host a llama-server worker; retain the owning runtime.
+    let provider = if has("lmstudio")
+        || has("llmster")
+        || prefix.contains("lm studio")
+        || prefix.contains(".lmstudio/")
     {
+        "LM Studio"
+    } else if has("omlx") {
+        "oMLX"
+    } else if has("ollama") {
+        "Ollama"
+    } else if has("koboldcpp") {
+        "KoboldCpp"
+    } else if has("localai") {
+        "LocalAI"
+    } else if has("llamaserver") || has("llamacpp") {
+        "llama.cpp"
+    } else if has("mlxlm") {
         "mlx-lm"
     } else {
         return None;
@@ -8304,6 +8301,40 @@ mod tests {
         assert_eq!(processes[0].state, "Rs");
         assert_eq!(processes[0].pageins, Some(20));
         assert!(processes[0].command.contains("--port 8080"));
+    }
+
+    #[test]
+    fn detects_runtime_entrypoints_with_consistent_provider_names() {
+        for (name, command, provider) in [
+            ("Python", "python -m mlx_lm.server --model test", "mlx-lm"),
+            ("mlx_lm.server", "mlx_lm.server --model test", "mlx-lm"),
+            ("ollama", "/usr/local/bin/ollama serve", "Ollama"),
+            ("llama-server", "llama-server --model test", "llama.cpp"),
+            ("Python", "python KoboldCpp.py --model test", "KoboldCpp"),
+            (
+                "LM",
+                "Studio /Applications/LM Studio.app/Contents/MacOS/LM Studio",
+                "LM Studio",
+            ),
+            ("llmster", "llmster", "LM Studio"),
+            (
+                "llama-server",
+                "/home/user/.lmstudio/engines/llama-server",
+                "LM Studio",
+            ),
+            ("local-ai", "local-ai run", "LocalAI"),
+        ] {
+            assert!(is_llm_process(name, command), "{command}");
+            assert_eq!(
+                process_provider(name, command).as_deref(),
+                Some(provider),
+                "{command}"
+            );
+            let snapshot = parse_processes(&format!("42 1024 1.0 0.1 S 0 {name} {command}"));
+            assert_eq!(snapshot.provider.as_deref(), Some(provider), "{command}");
+        }
+        assert!(!is_llm_process("python", "python client.py --model ollama"));
+        assert!(!is_llm_process("mlxtop", "mlxtop --help"));
     }
 
     #[test]
